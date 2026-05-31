@@ -1,0 +1,17 @@
+outputs/
+kernel_meta/
+fusion_result.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Ascend compile / debug artifacts (operator .o/.json dumps, exception dumps)
+extra-info/
+*.egg-info/
+build/
+dist/
+
+# Claude Code session data
+.claude/
+

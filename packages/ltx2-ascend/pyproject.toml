@@ -1,0 +1,13 @@
+[project]
+name = "ltx2-ascend"
+version = "0.1.0"
+description = "Ascend 910A inference helpers for LTX-2"
+requires-python = ">=3.10"
+dependencies = ["ltx-core", "ltx-pipelines"]
+
+[project.scripts]
+ltx2-ascend = "ltx2_ascend.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"
