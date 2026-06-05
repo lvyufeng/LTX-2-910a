@@ -2,6 +2,7 @@
 ltx-core = { workspace = true }
 ltx-pipelines = { workspace = true }
 ltx2-ascend = { workspace = true }
+ltx2-ascend-ops = { workspace = true }
 
 [tool.uv.workspace]
 members = ["packages/*"]

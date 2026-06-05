@@ -1,8 +1,13 @@
-from typing import Set, Tuple
+import logging
+import os
+import time
+from contextlib import contextmanager
+from typing import Iterator, Set, Tuple
 
 import torch
 import torch.nn.functional as F
 
+from ltx_core.accelerator import synchronize
 from ltx_core.components.patchifiers import AudioPatchifier
 from ltx_core.model.audio_vae.attention import AttentionType, make_attn
 from ltx_core.model.audio_vae.causal_conv_2d import make_conv2d
@@ -16,6 +21,49 @@ from ltx_core.model.common.normalization import NormType, build_normalization_la
 from ltx_core.types import Audio, AudioLatentShape
 
 LATENT_DOWNSAMPLE_FACTOR = 4
+_EXPERIMENTAL_PRECISION_ENV = "LTX2_ASCEND_EXPERIMENTAL_PRECISION"
+_AUDIO_DECODER_LOWRES_AUTOCAST_ENV = "LTX2_ASCEND_AUDIO_DECODER_LOWRES_AUTOCAST"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_LOGGED_EXPERIMENTAL_PRECISION_SCOPES: set[str] = set()
+
+logger = logging.getLogger(__name__)
+
+
+def _profile_enabled() -> bool:
+    return os.environ.get("LTX2_ASCEND_PROFILE", "").lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _profile_section(name: str, device: torch.device | None = None) -> Iterator[None]:
+    if not _profile_enabled():
+        yield
+        return
+    synchronize(device)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        synchronize(device)
+        logger.info("[profile] %s %.3fs", name, time.perf_counter() - start)
+
+
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUTHY_ENV_VALUES
+
+
+def _audio_lowres_autocast_enabled(device: torch.device) -> bool:
+    return (
+        device.type == "npu"
+        and _env_enabled(_EXPERIMENTAL_PRECISION_ENV)
+        and _env_enabled(_AUDIO_DECODER_LOWRES_AUTOCAST_ENV)
+    )
+
+
+def _log_experimental_precision_once(scope: str, message: str) -> None:
+    if scope in _LOGGED_EXPERIMENTAL_PRECISION_SCOPES:
+        return
+    _LOGGED_EXPERIMENTAL_PRECISION_SCOPES.add(scope)
+    logger.warning("Experimental precision enabled: %s", message)
 
 
 def build_mid_block(
@@ -391,6 +439,19 @@ class AudioDecoder(torch.nn.Module):
         """
         sample, target_shape = self._denormalize_latents(sample)
 
+        if _audio_lowres_autocast_enabled(sample.device):
+            _log_experimental_precision_once(
+                "audio decoder low-resolution autocast",
+                "audio VAE decoder runs conv_in/mid/low-resolution upsampling under NPU float16 autocast; high-resolution output stays fp32",
+            )
+            with torch.autocast(device_type="npu", dtype=torch.float16):
+                h = self.conv_in(sample)
+                h = run_mid_block(self.mid, h)
+                h = self._run_upsampling_path(h, min_level=2)
+            h = self._run_upsampling_path(h.float(), max_level=1)
+            h = self._finalize_output(h.float())
+            return self._adjust_output_shape(h.float(), target_shape)
+
         h = self.conv_in(sample)
         h = run_mid_block(self.mid, h)
         h = self._run_upsampling_path(h)
@@ -470,8 +531,18 @@ class AudioDecoder(torch.nn.Module):
 
         return decoded_output
 
-    def _run_upsampling_path(self, h: torch.Tensor) -> torch.Tensor:
+    def _run_upsampling_path(
+        self,
+        h: torch.Tensor,
+        *,
+        min_level: int | None = None,
+        max_level: int | None = None,
+    ) -> torch.Tensor:
         for level in reversed(range(self.num_resolutions)):
+            if min_level is not None and level < min_level:
+                continue
+            if max_level is not None and level > max_level:
+                continue
             stage = self.up[level]
             for block_idx, block in enumerate(stage.block):
                 h = block(h, temb=None)
@@ -503,6 +574,8 @@ def decode_audio(latent: torch.Tensor, audio_decoder: "AudioDecoder", vocoder: "
     Returns:
         Decoded audio with waveform and sampling rate.
     """
-    decoded_audio = audio_decoder(latent)
-    waveform = vocoder(decoded_audio).squeeze(0).float()
+    with _profile_section("audio_decode.vae_decode", latent.device):
+        decoded_audio = audio_decoder(latent)
+    with _profile_section("audio_decode.vocoder", decoded_audio.device):
+        waveform = vocoder(decoded_audio).squeeze(0).float()
     return Audio(waveform=waveform, sampling_rate=vocoder.output_sampling_rate)

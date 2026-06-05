@@ -71,6 +71,10 @@ class TI2VidTwoStagesHQPipeline:
         text_encoder_dtype: torch.dtype | None = None,
         embeddings_processor_device: torch.device | None = None,
         embeddings_processor_dtype: torch.dtype | None = None,
+        video_decoder_device: torch.device | None = None,
+        video_decoder_dtype: torch.dtype | None = None,
+        audio_decoder_device: torch.device | None = None,
+        audio_decoder_dtype: torch.dtype | None = None,
         text_encoder_layerwise_devices: list[torch.device] | None = None,
         tensor_parallel: bool = False,
         resident_models: bool = False,
@@ -116,8 +120,20 @@ class TI2VidTwoStagesHQPipeline:
             resident=resident_models and not tensor_parallel,
             tensor_parallel=tensor_parallel,
         )
-        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.device, registry=registry, resident=resident_models)
-        self.audio_decoder = AudioDecoder(checkpoint_path, self.dtype, self.device, registry=registry, resident=resident_models)
+        self.video_decoder = VideoDecoder(
+            checkpoint_path,
+            video_decoder_dtype or self.dtype,
+            video_decoder_device or self.device,
+            registry=registry,
+            resident=resident_models,
+        )
+        self.audio_decoder = AudioDecoder(
+            checkpoint_path,
+            audio_decoder_dtype or self.dtype,
+            audio_decoder_device or self.device,
+            registry=registry,
+            resident=resident_models,
+        )
 
         self.stage_1 = DiffusionStage(
             checkpoint_path,
@@ -244,7 +260,12 @@ class TI2VidTwoStagesHQPipeline:
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
         if self._tensor_parallel:
             with profile_section("video_upsampler", self.device):
-                upscaled_video_latent = self.upsampler.distributed_tensor_parallel(video_state.latent if is_rank0() else None)
+                # After tensor-parallel stage 1 every rank already owns the same
+                # full video latent. Passing None on nonzero ranks forces an extra
+                # object-broadcast communicator here, which can time out on HCCL
+                # after the diffusion all-reduces. Feed the local latent on all
+                # ranks and let the TP upsampler run collectively.
+                upscaled_video_latent = self.upsampler.distributed_tensor_parallel(video_state.latent)
         else:
             with profile_section("video_upsampler", self.device):
                 upscaled_video_latent = self.upsampler(video_state.latent[:1])

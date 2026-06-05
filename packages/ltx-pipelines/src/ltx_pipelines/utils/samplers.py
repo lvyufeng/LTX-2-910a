@@ -160,14 +160,28 @@ def _get_plain_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tenso
     return torch.randn(x.shape, generator=generator, dtype=x.dtype, device=x.device)
 
 
+def _std_from_centered(
+    centered: torch.Tensor,
+    dim: int | tuple[int, ...] | None = None,
+    keepdim: bool = False,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    # torch.std dispatches to aclnnStd, which is unsupported on the target
+    # Ascend stack.  Compute std from mean(square(centered)) instead; this
+    # stays on NPU and only uses reductions/sqrt that are available there.
+    var = (centered * centered).mean(dim=dim, keepdim=keepdim)
+    return var.clamp_min(eps).sqrt()
+
+
 def _channelwise_normalize(x: torch.Tensor) -> torch.Tensor:
-    return x.sub_(x.mean(dim=(-2, -1), keepdim=True)).div_(x.std(dim=(-2, -1), keepdim=True))
+    x = x.sub_(x.mean(dim=(-2, -1), keepdim=True))
+    return x.div_(_std_from_centered(x, dim=(-2, -1), keepdim=True))
 
 
 def _get_new_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
-    noise = torch.randn(x.shape, generator=generator, dtype=torch.float64, device=generator.device)
-    noise = (noise - noise.mean()) / noise.std()
-    return _channelwise_normalize(noise)
+    noise = torch.randn(x.shape, generator=generator, dtype=torch.float32, device=generator.device)
+    noise = noise.sub_(noise.mean()).div_(_std_from_centered(noise))
+    return _channelwise_normalize(noise).to(dtype=x.dtype)
 
 
 def _broadcast_tp_noise(noise: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor | None:
@@ -187,7 +201,7 @@ def _draw_noise_for_all_ranks(
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor],
 ) -> torch.Tensor:
     noise = new_noise_fn(x, generator) if not is_distributed() or world_size() <= 1 or is_rank0() else None
-    noise_dtype = torch.float64 if new_noise_fn is _get_new_noise else x.dtype
+    noise_dtype = x.dtype
     if noise is not None:
         noise_dtype = noise.dtype
     if not is_distributed() or world_size() <= 1:
@@ -215,8 +229,10 @@ def _inject_sde_noise(
     sigmas_copy = sigmas.clone()
     new_noise = _draw_noise_for_all_ranks(state.latent, step_noise_generator, new_noise_fn)
     if not legacy_mode:
-        timesteps = timesteps_from_mask(state.denoise_mask.double(), sigmas_copy[step_idx].double())
-        next_timesteps = timesteps_from_mask(state.denoise_mask.double(), sigmas_copy[step_idx + 1].double())
+        denoise_mask_f32 = state.denoise_mask.to(torch.float32)
+        sigmas_copy_f32 = sigmas_copy.to(torch.float32)
+        timesteps = timesteps_from_mask(denoise_mask_f32, sigmas_copy_f32[step_idx])
+        next_timesteps = timesteps_from_mask(denoise_mask_f32, sigmas_copy_f32[step_idx + 1])
         sigmas = torch.stack([timesteps, next_timesteps])
         step_idx = 0
     x_next = stepper.step(
@@ -305,22 +321,27 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
 
     n_full_steps = len(sigmas) - 1
     # inject minimal sigma value to avoid division by zero
-    if sigmas[-1] == 0:
-        sigmas = torch.cat([sigmas[:-1], torch.tensor([0.0011, 0.0], device=sigmas.device)], dim=0)
-    # Compute step sizes in hyperbolic space
-    hs = -torch.log(sigmas[1:].double().cpu() / (sigmas[:-1].double().cpu()))
+    final_sigma_is_zero = bool(float(sigmas[-1].detach().item()) == 0.0)
+    if final_sigma_is_zero:
+        sigmas = torch.cat([sigmas[:-1], torch.tensor([0.0011, 0.0], device=sigmas.device, dtype=sigmas.dtype)], dim=0)
+    # Compute step sizes in hyperbolic space on device.  Ascend does not support
+    # true fp64 here and will cast double tensors anyway, so keep the Res2s
+    # schedule math in fp32 instead of using .double().cpu().
+    sigmas_f32 = sigmas.to(torch.float32)
+    hs = -torch.log(sigmas_f32[1:] / sigmas_f32[:-1])
 
     # Initialize phi cache for reuse across loop iterations
     phi_cache = {}
     c2 = 0.5  # Midpoint for res_2s
 
     for step_idx in tqdm(range(n_full_steps)):
-        sigma = sigmas[step_idx].double()
-        sigma_next = sigmas[step_idx + 1].double()
+        sigma = sigmas_f32[step_idx]
+        sigma_next = sigmas_f32[step_idx + 1]
 
-        # Initialize anchor point
-        x_anchor_video = video_state.latent.clone().double() if video_state is not None else None
-        x_anchor_audio = audio_state.latent.clone().double() if audio_state is not None else None
+        # Initialize anchor point. Keep Res2s arithmetic in fp32 on NPU; model
+        # inputs are cast back to model_dtype at each transformer call.
+        x_anchor_video = video_state.latent.clone().to(torch.float32) if video_state is not None else None
+        x_anchor_audio = audio_state.latent.clone().to(torch.float32) if audio_state is not None else None
 
         # ====================================================================
         # STAGE 1: Evaluate at current point
@@ -345,15 +366,15 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
         # Compute substep x using RK coefficient a21
         # ====================================================================
         if x_anchor_video is not None and denoised_video_1 is not None:
-            eps_1_video = denoised_video_1.double() - x_anchor_video
-            x_mid_video = x_anchor_video.double() + h * a21 * eps_1_video
+            eps_1_video = denoised_video_1.to(torch.float32) - x_anchor_video
+            x_mid_video = x_anchor_video.to(torch.float32) + h * a21 * eps_1_video
         else:
             eps_1_video = None
             x_mid_video = None
 
         if x_anchor_audio is not None and denoised_audio_1 is not None:
-            eps_1_audio = denoised_audio_1.double() - x_anchor_audio
-            x_mid_audio = x_anchor_audio.double() + h * a21 * eps_1_audio
+            eps_1_audio = denoised_audio_1.to(torch.float32) - x_anchor_audio
+            x_mid_audio = x_anchor_audio.to(torch.float32) + h * a21 * eps_1_audio
         else:
             eps_1_audio = None
             x_mid_audio = None
@@ -381,14 +402,14 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
         # ====================================================================
         # ITERATIVE REFINEMENT (Bong Iteration)
         # ====================================================================
-        if bongmath and h < 0.5 and sigma > 0.03:
+        if bongmath and h < 0.5 and float(sigma.detach().item()) > 0.03:
             for _ in range(bongmath_max_iter):
                 if x_mid_video is not None and eps_1_video is not None:
                     x_anchor_video = x_mid_video - h * a21 * eps_1_video
-                    eps_1_video = denoised_video_1.double() - x_anchor_video
+                    eps_1_video = denoised_video_1.to(torch.float32) - x_anchor_video
                 if x_mid_audio is not None and eps_1_audio is not None:
                     x_anchor_audio = x_mid_audio - h * a21 * eps_1_audio
-                    eps_1_audio = denoised_audio_1.double() - x_anchor_audio
+                    eps_1_audio = denoised_audio_1.to(torch.float32) - x_anchor_audio
 
         # ====================================================================
         # STAGE 2: Evaluate at substep point (WITH NOISE)
@@ -422,13 +443,13 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
         # FINAL COMBINATION: Compute x_next using RK coefficients
         # ====================================================================
         if x_anchor_video is not None and eps_1_video is not None and denoised_video_2 is not None:
-            eps_2_video = denoised_video_2.double() - x_anchor_video
+            eps_2_video = denoised_video_2.to(torch.float32) - x_anchor_video
             x_next_video = x_anchor_video + h * (b1 * eps_1_video + b2 * eps_2_video)
         else:
             x_next_video = None
 
         if x_anchor_audio is not None and eps_1_audio is not None and denoised_audio_2 is not None:
-            eps_2_audio = denoised_audio_2.double() - x_anchor_audio
+            eps_2_audio = denoised_audio_2.to(torch.float32) - x_anchor_audio
             x_next_audio = x_anchor_audio + h * (b1 * eps_1_audio + b2 * eps_2_audio)
         else:
             x_next_audio = None
@@ -460,7 +481,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
             audio_state = replace(audio_state, latent=x_next_audio.to(model_dtype))
 
     # Final step if we need to fully remove the noise
-    if sigmas[-1] == 0:
+    if final_sigma_is_zero:
         video_result_final, audio_result_final = denoiser(transformer, video_state, audio_state, sigmas, n_full_steps)
         denoised_video_1 = video_result_final.denoised if video_result_final is not None else None
         denoised_audio_1 = audio_result_final.denoised if audio_result_final is not None else None

@@ -1,8 +1,11 @@
+import os
+from types import SimpleNamespace
+
 import pytest
 
 from ltx_pipelines.utils.constants import LTX_2_3_HQ_PARAMS, LTX_2_3_PARAMS
 from ltx_pipelines.utils.helpers import assert_num_frames
-from ltx2_ascend.cli import _parse_image, _validate_generation_args, parse_args
+from ltx2_ascend.cli import _parse_image, _set_default_attention_chunk, _validate_generation_args, parse_args
 
 
 def test_standard_preset_uses_ltx_23_defaults():
@@ -50,6 +53,55 @@ def test_smoke_preset_preserves_fast_settings():
     assert args.seed == 0
     assert args.video_stg_block == [28]
     assert args.audio_stg_block == [28]
+
+
+def test_tp_hq_attention_chunk_default_preserves_validated_hq_override(monkeypatch):
+    monkeypatch.delenv("LTX2_ASCEND_ATTENTION_CHUNK", raising=False)
+    monkeypatch.delenv("LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB", raising=False)
+    monkeypatch.delenv("LTX2_ASCEND_TP_HQ_SHAPE_POLICY", raising=False)
+    monkeypatch.delenv("LTX2_ASCEND_SOFTMAX_FP16", raising=False)
+    args = SimpleNamespace(tensor_parallel=True, pipeline="two-stage-hq")
+
+    _set_default_attention_chunk(args, SimpleNamespace(type="npu"))
+
+    assert os.environ["LTX2_ASCEND_ATTENTION_CHUNK"] == "1536"
+    assert os.environ["LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB"] == "1600"
+    assert os.environ["LTX2_ASCEND_TP_HQ_SHAPE_POLICY"] == "1"
+    assert os.environ["LTX2_ASCEND_SOFTMAX_FP16"] == "1"
+
+
+def test_tp_hq_attention_chunk_preserves_env_override(monkeypatch):
+    monkeypatch.setenv("LTX2_ASCEND_ATTENTION_CHUNK", "512")
+    monkeypatch.setenv("LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB", "768")
+    monkeypatch.setenv("LTX2_ASCEND_SOFTMAX_FP16", "0")
+    monkeypatch.delenv("LTX2_ASCEND_TP_HQ_SHAPE_POLICY", raising=False)
+    args = SimpleNamespace(tensor_parallel=True, pipeline="two-stage-hq")
+
+    _set_default_attention_chunk(args, SimpleNamespace(type="npu"))
+
+    assert os.environ["LTX2_ASCEND_ATTENTION_CHUNK"] == "512"
+    assert os.environ["LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB"] == "768"
+    assert os.environ["LTX2_ASCEND_SOFTMAX_FP16"] == "0"
+    assert "LTX2_ASCEND_TP_HQ_SHAPE_POLICY" not in os.environ
+
+
+def test_tp_hq_attention_defaults_are_scoped_to_npu_tensor_parallel_hq(monkeypatch):
+    for name in (
+        "LTX2_ASCEND_ATTENTION_CHUNK",
+        "LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB",
+        "LTX2_ASCEND_TP_HQ_SHAPE_POLICY",
+        "LTX2_ASCEND_SOFTMAX_FP16",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    _set_default_attention_chunk(SimpleNamespace(tensor_parallel=False, pipeline="two-stage-hq"), SimpleNamespace(type="npu"))
+    _set_default_attention_chunk(SimpleNamespace(tensor_parallel=True, pipeline="two-stage"), SimpleNamespace(type="npu"))
+    _set_default_attention_chunk(SimpleNamespace(tensor_parallel=True, pipeline="two-stage-hq"), SimpleNamespace(type="cpu"))
+
+    assert "LTX2_ASCEND_ATTENTION_CHUNK" not in os.environ
+    assert "LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB" not in os.environ
+    assert "LTX2_ASCEND_TP_HQ_SHAPE_POLICY" not in os.environ
+    assert "LTX2_ASCEND_SOFTMAX_FP16" not in os.environ
 
 
 def test_user_overrides_survive_preset_resolution():

@@ -1,9 +1,45 @@
+import logging
+import os
 from typing import NamedTuple
 
 import torch
 from torch import nn
 
 from ltx_core.text_encoders.gemma.embeddings_connector import Embeddings1DConnector
+
+_EXPERIMENTAL_PRECISION_ENV = "LTX2_ASCEND_EXPERIMENTAL_PRECISION"
+_EMBEDDINGS_FEATURE_EXTRACTOR_AUTOCAST_ENV = "LTX2_ASCEND_EMBEDDINGS_FEATURE_EXTRACTOR_AUTOCAST"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_LOGGED_EXPERIMENTAL_PRECISION_SCOPES: set[str] = set()
+
+logger = logging.getLogger(__name__)
+
+
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUTHY_ENV_VALUES
+
+
+def _feature_extractor_autocast_enabled(device: torch.device) -> bool:
+    return (
+        device.type == "npu"
+        and _env_enabled(_EXPERIMENTAL_PRECISION_ENV)
+        and _env_enabled(_EMBEDDINGS_FEATURE_EXTRACTOR_AUTOCAST_ENV)
+    )
+
+
+def _module_parameter_dtype(module: nn.Module) -> torch.dtype | None:
+    for parameter in module.parameters(recurse=True):
+        return parameter.dtype
+    for buffer in module.buffers(recurse=True):
+        return buffer.dtype
+    return None
+
+
+def _log_experimental_precision_once(scope: str, message: str) -> None:
+    if scope in _LOGGED_EXPERIMENTAL_PRECISION_SCOPES:
+        return
+    _LOGGED_EXPERIMENTAL_PRECISION_SCOPES.add(scope)
+    logger.warning("Experimental precision enabled: %s", message)
 
 
 class EmbeddingsProcessorOutput(NamedTuple):
@@ -84,12 +120,14 @@ class EmbeddingsProcessor(nn.Module):
         video_features = _apply_right_pad_order(video_features, sort_idx)
         video_encoded, video_mask = self.video_connector(video_features, mask_for_connector)
         binary_mask = _to_binary_mask(video_mask, video_encoded.shape[:2])
-        video_encoded = video_encoded * binary_mask
+        binary_mask_bool = binary_mask.to(torch.bool)
+        video_encoded = torch.where(binary_mask_bool, video_encoded, torch.zeros_like(video_encoded))
 
         audio_encoded = None
         if self.audio_connector is not None:
             audio_features = _apply_right_pad_order(audio_features, sort_idx)
             audio_encoded, _ = self.audio_connector(audio_features, mask_for_connector)
+            audio_encoded = torch.where(binary_mask_bool, audio_encoded, torch.zeros_like(audio_encoded))
 
         return video_encoded, audio_encoded, binary_mask.squeeze(-1)
 
@@ -110,7 +148,32 @@ class EmbeddingsProcessor(nn.Module):
         if self.feature_extractor is None:
             raise ValueError("feature_extractor is required for process_hidden_states()")
 
-        video_feats, audio_feats = self.feature_extractor(hidden_states, attention_mask, padding_side)
+        input_device = hidden_states[0].device if hidden_states else attention_mask.device
+        video_connector_dtype = _module_parameter_dtype(self.video_connector)
+        audio_connector_dtype = (
+            _module_parameter_dtype(self.audio_connector) if self.audio_connector is not None else video_connector_dtype
+        )
+        connector_dtype = video_connector_dtype if video_connector_dtype == audio_connector_dtype else None
+        use_feature_autocast = _feature_extractor_autocast_enabled(input_device) and connector_dtype == torch.float32
+        if use_feature_autocast:
+            _log_experimental_precision_once(
+                "embeddings feature extractor autocast",
+                "embeddings feature extractor uses NPU float16 autocast; connectors and masks stay fp32",
+            )
+            with torch.autocast(device_type="npu", dtype=torch.float16):
+                video_feats, audio_feats = self.feature_extractor(hidden_states, attention_mask, padding_side)
+            video_feats = video_feats.to(dtype=connector_dtype)
+            if audio_feats is not None:
+                audio_feats = audio_feats.to(dtype=connector_dtype)
+        else:
+            if _feature_extractor_autocast_enabled(input_device) and connector_dtype != torch.float32:
+                _log_experimental_precision_once(
+                    "embeddings feature extractor autocast skipped",
+                    "embeddings feature extractor autocast skipped because connector dtypes are "
+                    f"video={video_connector_dtype}, audio={audio_connector_dtype}",
+                )
+            video_feats, audio_feats = self.feature_extractor(hidden_states, attention_mask, padding_side)
+
         additive_mask = convert_to_additive_mask(attention_mask, video_feats.dtype)
         video_enc, audio_enc, binary_mask = self.create_embeddings(video_feats, audio_feats, additive_mask)
         return EmbeddingsProcessorOutput(video_enc, audio_enc, binary_mask)

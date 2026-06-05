@@ -1,0 +1,14 @@
+[
+  {
+    "op": "StreamingAttention",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "q", "param_type": "required", "format": ["ND"], "type": ["fp16"]},
+      {"name": "k", "param_type": "required", "format": ["ND"], "type": ["fp16"]},
+      {"name": "v", "param_type": "required", "format": ["ND"], "type": ["fp16"]}
+    ],
+    "output_desc": [
+      {"name": "out", "param_type": "required", "format": ["ND"], "type": ["fp16"]}
+    ]
+  }
+]

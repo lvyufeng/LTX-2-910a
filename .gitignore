@@ -10,7 +10,17 @@ __pycache__/
 extra-info/
 *.egg-info/
 build/
+**/build/
+**/build_out/
+**/kernel_meta/
 dist/
+*.so
+*.run
+*.o
+*.a
+
+# Local recovery/session snapshots
+.backup_session/
 
 # Claude Code session data
 .claude/

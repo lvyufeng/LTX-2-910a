@@ -80,11 +80,14 @@ class Res2sDiffusionStep(DiffusionStepProtocol):
             sigma_down = sigma_next
             sigma_up = torch.zeros_like(sigma_next)
 
-        sigma_up = torch.nan_to_num(sigma_up if sigma_up is not None else torch.zeros_like(sigma_next), 0.0)
-        # Replace NaNs in sigma_down with corresponding sigma_next elements (float32)
-        nan_mask = torch.isnan(sigma_down)
-        sigma_down[nan_mask] = sigma_next[nan_mask].to(sigma_down.dtype)
-        alpha_ratio = torch.nan_to_num(alpha_ratio, 1.0)
+        sigma_up = sigma_up if sigma_up is not None else torch.zeros_like(sigma_next)
+        # Avoid torch.nan_to_num/isnan on Ascend: these dispatch to unsupported
+        # aclnnNanToNum/aclnnStd kernels on current CANN stacks.  x == x is false
+        # only for NaN and works for scalar schedule tensors without touching model
+        # activations or moving latents off device.
+        sigma_up = torch.where(sigma_up == sigma_up, sigma_up, torch.zeros_like(sigma_up))
+        sigma_down = torch.where(sigma_down == sigma_down, sigma_down, sigma_next.to(sigma_down.dtype))
+        alpha_ratio = torch.where(alpha_ratio == alpha_ratio, alpha_ratio, torch.ones_like(alpha_ratio))
 
         return alpha_ratio, sigma_down, sigma_up
 
@@ -112,16 +115,17 @@ class Res2sDiffusionStep(DiffusionStepProtocol):
         sigma_next = sigmas[step_index + 1]
         alpha_ratio, sigma_down, sigma_up = self.get_sde_coeff(sigma_next, sigma_up=sigma_next * eta)
         output_dtype = denoised_sample.dtype
-        if torch.any(sigma_up == 0) or torch.any(sigma_next == 0):
-            return denoised_sample
 
         # Extract epsilon prediction
         eps_next = (sample - denoised_sample) / (sigma - sigma_next)
         denoised_next = sample - sigma * eps_next
 
-        # Mix deterministic and stochastic components
+        # Mix deterministic and stochastic components.  Keep the zero-sigma
+        # shortcut on device instead of syncing a scalar to CPU; this preserves
+        # the all-NPU execution path while matching the previous branch result.
         x_noised = alpha_ratio * (denoised_next + sigma_down * eps_next) + sigma_up * noise
-        return x_noised.to(output_dtype)
+        active = (sigma_up != 0) & (sigma_next != 0)
+        return torch.where(active, x_noised, denoised_sample).to(output_dtype)
 
 
 class EulerCfgPpDiffusionStep(DiffusionStepProtocol):

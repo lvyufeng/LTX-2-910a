@@ -1,0 +1,12 @@
+[
+  {
+    "op": "LongKSoftmax",
+    "language": "cpp",
+    "input_desc": [
+      {"name": "scores", "param_type": "required", "format": ["ND"], "type": ["fp16"]}
+    ],
+    "output_desc": [
+      {"name": "probs", "param_type": "required", "format": ["ND"], "type": ["fp16"]}
+    ]
+  }
+]

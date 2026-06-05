@@ -1,4 +1,5 @@
 import logging
+import os
 from collections.abc import Iterator
 
 import torch
@@ -75,6 +76,10 @@ class TI2VidTwoStagesPipeline:
         text_encoder_dtype: torch.dtype | None = None,
         embeddings_processor_device: torch.device | None = None,
         embeddings_processor_dtype: torch.dtype | None = None,
+        video_decoder_device: torch.device | None = None,
+        video_decoder_dtype: torch.dtype | None = None,
+        audio_decoder_device: torch.device | None = None,
+        audio_decoder_dtype: torch.dtype | None = None,
         tensor_parallel: bool = False,
         resident_models: bool = False,
         dtype: torch.dtype | None = None,
@@ -113,8 +118,20 @@ class TI2VidTwoStagesPipeline:
             resident=resident_models and not tensor_parallel,
             tensor_parallel=tensor_parallel,
         )
-        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.device, registry=registry, resident=resident_models)
-        self.audio_decoder = AudioDecoder(checkpoint_path, self.dtype, self.device, registry=registry, resident=resident_models)
+        self.video_decoder = VideoDecoder(
+            checkpoint_path,
+            video_decoder_dtype or self.dtype,
+            video_decoder_device or self.device,
+            registry=registry,
+            resident=resident_models,
+        )
+        self.audio_decoder = AudioDecoder(
+            checkpoint_path,
+            audio_decoder_dtype or self.dtype,
+            audio_decoder_device or self.device,
+            registry=registry,
+            resident=resident_models,
+        )
 
         self.stage_1 = DiffusionStage(
             checkpoint_path,
@@ -234,15 +251,35 @@ class TI2VidTwoStagesPipeline:
                 max_batch_size=max_batch_size,
             )
 
+        if os.getenv("LTX2_DECODE_STAGE1", "").lower() in {"1", "true", "yes", "on"}:
+            logging.warning("LTX2_DECODE_STAGE1 is set; decoding stage 1 half-res latent before upsampler for diagnostics")
+            if self._tensor_parallel and not is_rank0():
+                return iter(()), None
+            decoded_video = self.video_decoder(video_state.latent[:1], tiling_config, generator)
+            decoded_audio = self.audio_decoder(audio_state.latent) if audio_state is not None else None
+            return decoded_video, decoded_audio
+
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
         if self._tensor_parallel:
             with profile_section("video_upsampler", self.device):
-                upscaled_video_latent = self.upsampler.distributed_tensor_parallel(video_state.latent if is_rank0() else None)
+                # After tensor-parallel stage 1 every rank already owns the same
+                # full video latent. Do not force an extra rank0 broadcast here;
+                # HCCL can time out creating a second communicator after the
+                # diffusion all-reduces.
+                upscaled_video_latent = self.upsampler.distributed_tensor_parallel(video_state.latent)
         else:
             with profile_section("video_upsampler", self.device):
                 upscaled_video_latent = self.upsampler(video_state.latent[:1])
         video_state = None
         cleanup_memory()
+
+        if os.getenv("LTX2_SKIP_STAGE2", "").lower() in {"1", "true", "yes", "on"}:
+            logging.warning("LTX2_SKIP_STAGE2 is set; decoding upsampled latent before stage 2 for diagnostics")
+            if self._tensor_parallel and not is_rank0():
+                return iter(()), None
+            decoded_video = self.video_decoder(upscaled_video_latent, tiling_config, generator)
+            decoded_audio = self.audio_decoder(audio_state.latent) if audio_state is not None else None
+            return decoded_video, decoded_audio
 
         stage_2_noise_scale = float(stage_2_sigmas[0].detach().cpu())
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)

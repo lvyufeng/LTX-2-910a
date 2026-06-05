@@ -71,6 +71,8 @@ class TI2VidOneStagePipeline:
         embeddings_processor_dtype: torch.dtype | None = None,
         video_decoder_device: torch.device | None = None,
         video_decoder_dtype: torch.dtype | None = None,
+        audio_decoder_device: torch.device | None = None,
+        audio_decoder_dtype: torch.dtype | None = None,
         tensor_parallel: bool = False,
         resident_models: bool = False,
         dtype: torch.dtype | None = None,
@@ -127,8 +129,8 @@ class TI2VidOneStagePipeline:
         )
         self.audio_decoder = AudioDecoder(
             checkpoint_path=checkpoint_path,
-            dtype=self.dtype,
-            device=self.device,
+            dtype=audio_decoder_dtype or self.dtype,
+            device=audio_decoder_device or self.device,
             registry=registry,
             resident=resident_models,
         )

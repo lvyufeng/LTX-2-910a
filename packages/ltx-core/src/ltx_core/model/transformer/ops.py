@@ -3,7 +3,7 @@ from typing import List, Protocol
 import torch
 from torch import nn
 
-from ltx_core.model.transformer.rope import apply_rotary_emb
+from ltx_core.model.transformer.rope_npu import apply_rotary_emb_pair_backend
 from ltx_core.utils import rms_norm
 
 
@@ -32,8 +32,7 @@ class PytorchPreAttention(PreAttentionCallable):
         q = attn_module.q_norm(q)
         k = attn_module.k_norm(k)
         if pe is not None:
-            q = apply_rotary_emb(q, pe, attn_module.rope_type)
-            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, attn_module.rope_type)
+            q, k = apply_rotary_emb_pair_backend(q, k, pe, k_pe, attn_module.rope_type)
         return q, k
 
 

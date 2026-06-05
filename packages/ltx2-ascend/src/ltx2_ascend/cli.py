@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import os
+
 import torch
 
 from ltx_core.accelerator import (
@@ -39,6 +41,143 @@ _SMOKE_FPS = 24.0
 _SMOKE_STEPS = 4
 _SMOKE_SEED = 0
 _TWO_STAGE_PIPELINES = {"two-stage", "two-stage-hq", "distilled"}
+_EXPERIMENTAL_PRECISION_ENV = "LTX2_ASCEND_EXPERIMENTAL_PRECISION"
+_EXPERIMENTAL_PRECISION_FLAGS = (
+    "LTX2_ASCEND_VIDEO_DECODER_AUTOCAST",
+    "LTX2_ASCEND_AUDIO_DECODER_LOWRES_AUTOCAST",
+    "LTX2_ASCEND_EMBEDDINGS_FEATURE_EXTRACTOR_AUTOCAST",
+)
+_ASCEND_ATTENTION_CHUNK_ENV = "LTX2_ASCEND_ATTENTION_CHUNK"
+_ASCEND_TP_HQ_DEFAULT_ATTENTION_CHUNK = "1536"
+_ASCEND_ATTENTION_CHUNK_MAX_MB_ENV = "LTX2_ASCEND_ATTENTION_CHUNK_MAX_MB"
+_ASCEND_TP_HQ_DEFAULT_ATTENTION_CHUNK_MAX_MB = "1600"
+_ASCEND_TP_HQ_SHAPE_POLICY_ENV = "LTX2_ASCEND_TP_HQ_SHAPE_POLICY"
+_ASCEND_SOFTMAX_FP16_ENV = "LTX2_ASCEND_SOFTMAX_FP16"
+_ASCEND_TP_HQ_DEFAULT_SOFTMAX_FP16 = "1"
+_ASCEND_ATTENTION_ENV = "LTX2_ASCEND_ATTENTION"
+_ASCEND_ROPE_ENV = "LTX2_ASCEND_ROPE"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUTHY_ENV_VALUES
+
+
+def _log_experimental_precision_flags() -> None:
+    if not _env_enabled(_EXPERIMENTAL_PRECISION_ENV):
+        return
+    active = [name for name in _EXPERIMENTAL_PRECISION_FLAGS if _env_enabled(name)]
+    if active:
+        logging.warning("experimental precision env flags active: %s", ", ".join(active))
+    else:
+        logging.warning("experimental precision master gate is active, but no per-feature flags are enabled")
+
+
+def _set_default_attention_chunk(args: argparse.Namespace, device: torch.device) -> None:
+    """Apply verified Ascend TP/HQ chunked-attention defaults unless overridden.
+
+    ``LTX2_ASCEND_ATTENTION_CHUNK`` changes query tiling only.  Keep the scoped
+    4-card TP HQ base chunk default at the previously validated 1536 value because
+    stage-1 self-attention (rank-local H=8, T=6240, D=128) is consistently faster
+    at chunk1536 than chunk2048.
+
+    A follow-up NPU shape sweep found the dominant stage-2 self-attention shape
+    (rank-local H=8, T=24960, D=128) is consistently bit-identical and faster at
+    chunk2048.  Enable the deterministic TP-HQ shape policy only when the CLI is
+    applying its default chunk; explicit ``LTX2_ASCEND_ATTENTION_CHUNK`` overrides
+    remain authoritative.  Raise only the TP-HQ chunk-cap budget to 1600 MiB so
+    stage-2 can actually use chunk2048, while keeping the separate full-eager
+    threshold conservative and preserving explicit env overrides.  Cross-attention
+    shapes remain below the full-eager threshold and already take the fastest eager
+    path.
+
+    Also default ``LTX2_ASCEND_SOFTMAX_FP16=1`` for the same scoped TP-HQ NPU path.
+    Representative TP-HQ self/cross attention shapes showed ~42-74% attention-op
+    speedups with tiny output deltas versus the fp32-softmax path.  Explicit env
+    overrides (including ``0``/``false``/``off``) remain authoritative.
+    """
+    is_tp_hq_npu = device.type == "npu" and args.tensor_parallel and args.pipeline == "two-stage-hq"
+    using_tp_hq_default_chunk = is_tp_hq_npu and _ASCEND_ATTENTION_CHUNK_ENV not in os.environ
+    if using_tp_hq_default_chunk:
+        os.environ[_ASCEND_ATTENTION_CHUNK_ENV] = _ASCEND_TP_HQ_DEFAULT_ATTENTION_CHUNK
+        logging.info(
+            "defaulting %s=%s for Ascend tensor-parallel HQ path",
+            _ASCEND_ATTENTION_CHUNK_ENV,
+            _ASCEND_TP_HQ_DEFAULT_ATTENTION_CHUNK,
+        )
+    elif device.type == "npu":
+        logging.info("using %s=%s", _ASCEND_ATTENTION_CHUNK_ENV, os.environ.get(_ASCEND_ATTENTION_CHUNK_ENV, "<unset>"))
+
+    if using_tp_hq_default_chunk and _ASCEND_TP_HQ_SHAPE_POLICY_ENV not in os.environ:
+        os.environ[_ASCEND_TP_HQ_SHAPE_POLICY_ENV] = "1"
+        logging.info(
+            "defaulting %s=1 for Ascend tensor-parallel HQ stage-2 long-K chunk policy",
+            _ASCEND_TP_HQ_SHAPE_POLICY_ENV,
+        )
+    elif device.type == "npu":
+        logging.info(
+            "using %s=%s",
+            _ASCEND_TP_HQ_SHAPE_POLICY_ENV,
+            os.environ.get(_ASCEND_TP_HQ_SHAPE_POLICY_ENV, "<unset>"),
+        )
+
+    if is_tp_hq_npu and _ASCEND_ATTENTION_CHUNK_MAX_MB_ENV not in os.environ:
+        os.environ[_ASCEND_ATTENTION_CHUNK_MAX_MB_ENV] = _ASCEND_TP_HQ_DEFAULT_ATTENTION_CHUNK_MAX_MB
+        logging.info(
+            "defaulting %s=%s for Ascend tensor-parallel HQ path",
+            _ASCEND_ATTENTION_CHUNK_MAX_MB_ENV,
+            _ASCEND_TP_HQ_DEFAULT_ATTENTION_CHUNK_MAX_MB,
+        )
+    elif device.type == "npu":
+        logging.info(
+            "using %s=%s",
+            _ASCEND_ATTENTION_CHUNK_MAX_MB_ENV,
+            os.environ.get(_ASCEND_ATTENTION_CHUNK_MAX_MB_ENV, "<unset>"),
+        )
+
+    if is_tp_hq_npu and _ASCEND_SOFTMAX_FP16_ENV not in os.environ:
+        os.environ[_ASCEND_SOFTMAX_FP16_ENV] = _ASCEND_TP_HQ_DEFAULT_SOFTMAX_FP16
+        logging.info(
+            "defaulting %s=%s for Ascend tensor-parallel HQ chunked attention",
+            _ASCEND_SOFTMAX_FP16_ENV,
+            _ASCEND_TP_HQ_DEFAULT_SOFTMAX_FP16,
+        )
+    elif device.type == "npu":
+        logging.info(
+            "using %s=%s",
+            _ASCEND_SOFTMAX_FP16_ENV,
+            os.environ.get(_ASCEND_SOFTMAX_FP16_ENV, "<unset>"),
+        )
+
+
+def _log_attention_backend(device: torch.device) -> None:
+    if device.type != "npu":
+        return
+    value = os.getenv(_ASCEND_ATTENTION_ENV, "").strip().lower()
+    if value in {"streaming", "custom"}:
+        resolved = "streaming (opt-in; unsupported shapes/native-missing fall back to chunked)"
+    elif value == "fused":
+        resolved = "npu_fusion_attention (experimental; runtime fallback on unsupported shapes)"
+    elif value in {"eager", "math"}:
+        resolved = "chunked"
+    else:
+        resolved = "auto"
+    logging.info("using %s=%s (attention backend: %s)", _ASCEND_ATTENTION_ENV, value or "<unset>", resolved)
+
+
+def _log_rope_backend(device: torch.device) -> None:
+    """Report the resolved RoPE backend on NPU (default ON = npu_rotary_mul).
+
+    CANN ``npu_rotary_mul`` is bit-exact to LTX SPLIT rope and faster on the HQ
+    A/B, so it is enabled by default on NPU.  Set ``LTX2_ASCEND_ROPE=eager`` (or
+    ``off``/``0``/``false``) to force the PyTorch fallback for debugging.
+    """
+    if device.type != "npu":
+        return
+    value = os.getenv(_ASCEND_ROPE_ENV, "").strip().lower()
+    disabled = {"eager", "math", "off", "disable", "disabled", "0", "false", "no"}
+    resolved = "eager" if value in disabled else "npu_rotary_mul"
+    logging.info("using %s=%s (rope backend: %s)", _ASCEND_ROPE_ENV, value or "<unset>", resolved)
 
 
 def _parse_image(value: str) -> ImageConditioningInput:
@@ -276,6 +415,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the video VAE decoder dtype independently from the inference dtype.",
     )
     parser.add_argument(
+        "--audio-decoder-device",
+        default=None,
+        help=(
+            "Override the audio VAE decoder + vocoder device independently from the inference device. "
+            "Use NPU float32 when NPU/FP16 audio decode is noisy."
+        ),
+    )
+    parser.add_argument(
+        "--audio-decoder-dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default=None,
+        help="Override the audio VAE decoder + vocoder dtype independently from the inference dtype.",
+    )
+    parser.add_argument(
         "--random-draw-device",
         default=None,
         help=(
@@ -498,6 +651,7 @@ def main() -> None:
 
     _validate_generation_args(args)
     _warn_for_low_quality_settings(args)
+    _log_experimental_precision_flags()
 
     required = ["checkpoint", "gemma_root"]
     if args.pipeline in ("two-stage", "two-stage-hq", "distilled"):
@@ -547,6 +701,9 @@ def main() -> None:
     layerwise_devices = tp_device_ids if args.layerwise else None
     if layerwise_devices:
         logging.info("using layerwise transformer devices: %s", ",".join(str(d) for d in layerwise_devices))
+    _set_default_attention_chunk(args, device)
+    _log_attention_backend(device)
+    _log_rope_backend(device)
 
     loras = tuple(_parse_loras(args.lora))
     distilled_loras = list(_parse_loras(args.distilled_lora))
@@ -559,8 +716,23 @@ def main() -> None:
         torch.device(args.embeddings_processor_device) if args.embeddings_processor_device else None
     )
     embeddings_processor_dtype = parse_torch_dtype(args.embeddings_processor_dtype)
+    # Ascend fp16/bf16 prompt embeddings projection has been verified to corrupt
+    # prompt context visually (花屏/garbled output).  Keep this component in fp32
+    # by default on NPU/TP; callers may still override explicitly for experiments.
+    if embeddings_processor_dtype is None and device.type == "npu":
+        embeddings_processor_dtype = torch.float32
     video_decoder_device = torch.device(args.video_decoder_device) if args.video_decoder_device else None
     video_decoder_dtype = parse_torch_dtype(args.video_decoder_dtype)
+    # Ascend fp16 two-stage/HQ video VAE decode has produced visible banding/garbling.
+    # Keep video decode in fp32 on NPU by default; experimental autocast remains opt-in via env.
+    if video_decoder_dtype is None and device.type == "npu":
+        video_decoder_dtype = torch.float32
+    audio_decoder_device = torch.device(args.audio_decoder_device) if args.audio_decoder_device else None
+    audio_decoder_dtype = parse_torch_dtype(args.audio_decoder_dtype)
+    # Ascend fp16 audio decode/vocoder can produce stutter/clicking/electric noise.
+    # Keep audio decode in fp32 on NPU by default, while transformer diffusion stays fp16.
+    if audio_decoder_dtype is None and device.type == "npu":
+        audio_decoder_dtype = torch.float32
     if text_encoder_dtype is not None:
         logging.info("using text encoder dtype %s", text_encoder_dtype)
     if embeddings_processor_device is not None or embeddings_processor_dtype is not None:
@@ -574,6 +746,12 @@ def main() -> None:
             "using video decoder device %s dtype %s",
             video_decoder_device or device,
             video_decoder_dtype or DEFAULT_DTYPE,
+        )
+    if audio_decoder_device is not None or audio_decoder_dtype is not None:
+        logging.info(
+            "using audio decoder device %s dtype %s",
+            audio_decoder_device or device,
+            audio_decoder_dtype or DEFAULT_DTYPE,
         )
     if args.pipeline == "one-stage":
         pipeline = TI2VidOneStagePipeline(
@@ -591,6 +769,8 @@ def main() -> None:
             embeddings_processor_dtype=embeddings_processor_dtype,
             video_decoder_device=video_decoder_device,
             video_decoder_dtype=video_decoder_dtype,
+            audio_decoder_device=audio_decoder_device,
+            audio_decoder_dtype=audio_decoder_dtype,
             text_encoder_layerwise_devices=text_encoder_layerwise_devices,
             tensor_parallel=args.tensor_parallel,
             resident_models=args.resident_models,
@@ -613,6 +793,10 @@ def main() -> None:
             text_encoder_dtype=text_encoder_dtype,
             embeddings_processor_device=embeddings_processor_device,
             embeddings_processor_dtype=embeddings_processor_dtype,
+            video_decoder_device=video_decoder_device,
+            video_decoder_dtype=video_decoder_dtype,
+            audio_decoder_device=audio_decoder_device,
+            audio_decoder_dtype=audio_decoder_dtype,
             text_encoder_layerwise_devices=text_encoder_layerwise_devices,
             tensor_parallel=args.tensor_parallel,
             resident_models=args.resident_models,
@@ -637,6 +821,10 @@ def main() -> None:
             text_encoder_dtype=text_encoder_dtype,
             embeddings_processor_device=embeddings_processor_device,
             embeddings_processor_dtype=embeddings_processor_dtype,
+            video_decoder_device=video_decoder_device,
+            video_decoder_dtype=video_decoder_dtype,
+            audio_decoder_device=audio_decoder_device,
+            audio_decoder_dtype=audio_decoder_dtype,
             text_encoder_layerwise_devices=text_encoder_layerwise_devices,
             tensor_parallel=args.tensor_parallel,
             resident_models=args.resident_models,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import os
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
@@ -16,7 +17,7 @@ from typing import Callable, TypeVar
 
 import torch
 
-from ltx_core.accelerator import is_npu_device
+from ltx_core.accelerator import is_npu_device, synchronize
 from ltx_core.batch_split import BatchSplitAdapter
 from ltx_core.block_streaming import DISK_CPU_SLOTS, StreamingModelBuilder
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
@@ -60,6 +61,7 @@ from ltx_core.model.transformer import (
     X0Model,
 )
 from ltx_core.model.transformer.attention import (
+    AscendChunkedAttention,
     AttentionCallable,
     AttentionFunction,
 )
@@ -111,6 +113,11 @@ from ltx_pipelines.utils.types import Denoiser, ModalitySpec, OffloadMode
 
 logger = logging.getLogger(__name__)
 
+_EXPERIMENTAL_PRECISION_ENV = "LTX2_ASCEND_EXPERIMENTAL_PRECISION"
+_VIDEO_DECODER_AUTOCAST_ENV = "LTX2_ASCEND_VIDEO_DECODER_AUTOCAST"
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_LOGGED_EXPERIMENTAL_PRECISION_SCOPES: set[str] = set()
+
 T = TypeVar("T")
 _M = TypeVar("_M", bound=torch.nn.Module)
 
@@ -118,6 +125,21 @@ _M = TypeVar("_M", bound=torch.nn.Module)
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUTHY_ENV_VALUES
+
+
+def _experimental_precision_enabled(name: str) -> bool:
+    return _env_enabled(_EXPERIMENTAL_PRECISION_ENV) and _env_enabled(name)
+
+
+def _log_experimental_precision_once(scope: str, message: str) -> None:
+    if scope in _LOGGED_EXPERIMENTAL_PRECISION_SCOPES:
+        return
+    _LOGGED_EXPERIMENTAL_PRECISION_SCOPES.add(scope)
+    logger.warning("Experimental precision enabled: %s", message)
 
 
 def _chain_quantization(
@@ -265,6 +287,45 @@ def _build_state_with_synchronized_noise(
 def _cleanup_iter(it: Iterator[torch.Tensor], model: torch.nn.Module) -> Iterator[torch.Tensor]:
     """Wrap an iterator to clean up *model* memory once it is exhausted or abandoned."""
     with gpu_model(model):
+        yield from it
+
+
+@contextmanager
+def _profiled_gpu_model(model: _M, *, teardown_profile: str | None = None) -> Iterator[_M]:
+    """Like ``gpu_model()``, with optional teardown profiling under ``LTX2_ASCEND_PROFILE``.
+
+    This preserves the existing model lifecycle exactly: yield the already-built
+    model, then synchronize, move parameters/buffers to meta, and run
+    ``cleanup_memory()``. The optional profile section only measures that teardown
+    cost; it does not change model math or residency.
+    """
+    try:
+        yield model
+    finally:
+        if teardown_profile is None:
+            synchronize()
+            model.to("meta")
+            cleanup_memory()
+        else:
+            with profile_section(teardown_profile):
+                synchronize()
+                model.to("meta")
+                cleanup_memory()
+
+
+def _maybe_autocast_iter(
+    it: Iterator[torch.Tensor],
+    device: torch.device,
+    *,
+    env_name: str,
+    scope: str,
+) -> Iterator[torch.Tensor]:
+    """Optionally keep an autocast scope active while a lazy iterator is consumed."""
+    if not _experimental_precision_enabled(env_name) or device.type != "npu":
+        yield from it
+        return
+    _log_experimental_precision_once(scope, f"{scope} uses NPU float16 autocast")
+    with torch.autocast(device_type="npu", dtype=torch.float16):
         yield from it
 
 
@@ -429,9 +490,12 @@ class DiffusionStage:
             return self._streaming_transformer_ctx()
         if self._resident:
             if self._resident_transformer is None:
-                self._resident_transformer = self._build_transformer(**kwargs)
+                with profile_section("diffusion_stage.transformer_build", self._device):
+                    self._resident_transformer = self._build_transformer(**kwargs)
             return nullcontext(self._resident_transformer)
-        return gpu_model(self._build_transformer(**kwargs))
+        with profile_section("diffusion_stage.transformer_build", self._device):
+            transformer = self._build_transformer(**kwargs)
+        return _profiled_gpu_model(transformer, teardown_profile="diffusion_stage.transformer_teardown")
 
     def model_context(self, **kwargs: object) -> AbstractContextManager:
         """Build the transformer, yield it, then free its memory on exit.
@@ -532,12 +596,13 @@ class DiffusionStage:
         if audio_state is not None:
             dump_tensor("diffusion_stage.denoised_audio_latent", audio_state.latent)
 
-        if video_state is not None and video_tools is not None:
-            video_state = video_tools.clear_conditioning(video_state)
-            video_state = video_tools.unpatchify(video_state)
-        if audio_state is not None and audio_tools is not None:
-            audio_state = audio_tools.clear_conditioning(audio_state)
-            audio_state = audio_tools.unpatchify(audio_state)
+        with profile_section("diffusion_stage.postprocess_state", self._device):
+            if video_state is not None and video_tools is not None:
+                video_state = video_tools.clear_conditioning(video_state)
+                video_state = video_tools.unpatchify(video_state)
+            if audio_state is not None and audio_tools is not None:
+                audio_state = audio_tools.clear_conditioning(audio_state)
+                audio_state = audio_tools.unpatchify(audio_state)
 
         return video_state, audio_state
 
@@ -638,6 +703,10 @@ class PromptEncoder:
         self._resident = resident
         self._resident_text_encoder: torch.nn.Module | None = None
         self._resident_embeddings_processor: EmbeddingsProcessor | None = None
+        self._tp_prompt_rank0_only = (
+            tensor_parallel
+            and os.getenv("LTX2_TP_PROMPT_RANK0_ONLY", "").lower() in {"1", "true", "yes", "on"}
+        )
         if tensor_parallel:
             if not is_npu_device(device):
                 raise ValueError("Gemma HCCL tensor parallelism requires an Ascend NPU device")
@@ -661,7 +730,8 @@ class PromptEncoder:
             self._streaming_text_encoder_builder = None
         else:
             module_ops = (*module_ops_from_gemma_root(gemma_root), _gemma_output_dtype_op(self._text_encoder_dtype))
-            if tensor_parallel:
+            disable_tp_text_encoder = os.getenv("LTX2_DISABLE_TP_TEXT_ENCODER", "").lower() in {"1", "true", "yes", "on"}
+            if tensor_parallel and not disable_tp_text_encoder:
                 module_ops = (*module_ops, build_hccl_gemma_tensor_parallel_op(device=self._text_encoder_device))
             elif layerwise_devices is not None and len(layerwise_devices) > 1:
                 module_ops = (*module_ops, build_gemma_layerwise_device_map_op(layerwise_devices))
@@ -684,8 +754,16 @@ class PromptEncoder:
                 blocks_prefix="model.model.language_model.layers",
             )
         embeddings_module_ops: tuple[ModuleOps, ...] = ()
-        if tensor_parallel:
+        # Keep the prompt embeddings processor as a full fp32 replica on each NPU
+        # by default.  The fp16 path has been verified to corrupt prompt context,
+        # and the HCCL-sharded processor is a separate numerical surface from the
+        # transformer TP path.  It is small enough to replicate; set
+        # LTX2_TP_EMBEDDINGS_PROCESSOR=1 only for explicit experiments.
+        if tensor_parallel and os.getenv("LTX2_TP_EMBEDDINGS_PROCESSOR", "").lower() in {"1", "true", "yes", "on"}:
             embeddings_module_ops = (build_hccl_embeddings_processor_tensor_parallel_op(device=self._embeddings_processor_device),)
+        elif is_npu_device(self._embeddings_processor_device):
+            chunked = AscendChunkedAttention()
+            embeddings_module_ops = (set_attention_module_op(chunked, chunked),)
         self._embeddings_processor_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=EmbeddingsProcessorConfigurator,
@@ -696,17 +774,19 @@ class PromptEncoder:
 
     def _build_text_encoder(self) -> torch.nn.Module:
         """Build the Gemma text encoder (non-streaming path)."""
-        text_encoder = self._text_encoder_builder.build(device=self._text_encoder_device, dtype=self._text_encoder_dtype).eval()
+        with profile_section("prompt_encoder.text_encoder_build", self._text_encoder_device):
+            text_encoder = self._text_encoder_builder.build(device=self._text_encoder_device, dtype=self._text_encoder_dtype).eval()
         if isinstance(text_encoder, GemmaTextEncoder):
             text_encoder._dtype = self._text_encoder_dtype
         return text_encoder
 
     def _build_embeddings_processor(self) -> EmbeddingsProcessor:
         """Build the embeddings processor on the configured processor device."""
-        return self._embeddings_processor_builder.build(
-            device=self._embeddings_processor_device,
-            dtype=self._embeddings_processor_dtype,
-        ).eval()
+        with profile_section("prompt_encoder.embeddings_processor_build", self._embeddings_processor_device):
+            return self._embeddings_processor_builder.build(
+                device=self._embeddings_processor_device,
+                dtype=self._embeddings_processor_dtype,
+            ).eval()
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
@@ -726,19 +806,26 @@ class PromptEncoder:
         enhance_prompt_seed: int = 42,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
-        logger.info("Building text encoder from %s", self._gemma_root)
-        with self._text_encoder_ctx() as text_encoder:
-            if enhance_first_prompt:
-                prompts = list(prompts)
-                prompts[0] = generate_enhanced_prompt(
-                    text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
-                )
-            raw_outputs = []
-            for prompt in prompts:
-                raw_outputs.append(text_encoder.encode(prompt))
+        raw_outputs = None
+        if self._tp_prompt_rank0_only and not is_rank0():
+            logger.info("Skipping prompt text encoder on nonzero TP rank")
+        else:
+            logger.info("Building text encoder from %s", self._gemma_root)
+            with self._text_encoder_ctx() as text_encoder:
+                if enhance_first_prompt:
+                    prompts = list(prompts)
+                    prompts[0] = generate_enhanced_prompt(
+                        text_encoder, prompts[0], enhance_prompt_image, seed=enhance_prompt_seed
+                    )
+                raw_outputs = []
+                for prompt_index, prompt in enumerate(prompts):
+                    with profile_section(f"prompt_encoder.text_encode.{prompt_index}", self._text_encoder_device):
+                        raw_outputs.append(text_encoder.encode(prompt))
+                    with profile_section(f"prompt_encoder.text_encode_cleanup.{prompt_index}", self._text_encoder_device):
+                        cleanup_memory()
+            logger.info("Text encoder done, building embeddings processor from %s", self._checkpoint_path)
+            with profile_section("prompt_encoder.after_text_cleanup", self._text_encoder_device):
                 cleanup_memory()
-        logger.info("Text encoder done, building embeddings processor from %s", self._checkpoint_path)
-        cleanup_memory()
 
         def move_raw_output(raw_output: tuple[tuple[torch.Tensor, ...], torch.Tensor]) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
             hidden_states, attention_mask = raw_output
@@ -748,6 +835,23 @@ class PromptEncoder:
             )
             return hidden_states, attention_mask.to(device=self._embeddings_processor_device)
 
+        if self._tp_prompt_rank0_only and not is_rank0():
+            result = []
+            for _ in prompts:
+                video_encoding = broadcast_tensor(None, device=self._device, src=0)
+                audio_encoding = broadcast_tensor(None, device=self._device, src=0)
+                attention_mask = broadcast_tensor(None, device=self._device, src=0)
+                result.append(
+                    EmbeddingsProcessorOutput(
+                        video_encoding=video_encoding,
+                        audio_encoding=audio_encoding,
+                        attention_mask=attention_mask,
+                    )
+                )
+            cleanup_memory()
+            logger.info("Prompt encoding received from rank0")
+            return result
+
         if self._resident:
             if self._resident_embeddings_processor is None:
                 self._resident_embeddings_processor = self._build_embeddings_processor()
@@ -756,22 +860,31 @@ class PromptEncoder:
             embeddings_processor_ctx = gpu_model(self._build_embeddings_processor())
         with embeddings_processor_ctx as embeddings_processor:
             result = []
-            for raw_output in raw_outputs:
-                hidden_states, attention_mask = move_raw_output(raw_output)
-                output = embeddings_processor.process_hidden_states(hidden_states, attention_mask)
-                result.append(
-                    EmbeddingsProcessorOutput(
-                        video_encoding=output.video_encoding.to(device=self._device, dtype=self._dtype),
+            for raw_index, raw_output in enumerate(raw_outputs):
+                with profile_section(f"prompt_encoder.move_raw_output.{raw_index}", self._embeddings_processor_device):
+                    hidden_states, attention_mask = move_raw_output(raw_output)
+                with profile_section(f"prompt_encoder.embeddings_process.{raw_index}", self._embeddings_processor_device):
+                    output = embeddings_processor.process_hidden_states(hidden_states, attention_mask)
+                with profile_section(f"prompt_encoder.embeddings_output_move.{raw_index}", self._embeddings_processor_device):
+                    prompt_output = EmbeddingsProcessorOutput(
+                        video_encoding=output.video_encoding.contiguous().to(device=self._device, dtype=self._dtype),
                         audio_encoding=(
                             None
                             if output.audio_encoding is None
-                            else output.audio_encoding.to(device=self._device, dtype=self._dtype)
+                            else output.audio_encoding.contiguous().to(device=self._device, dtype=output.audio_encoding.dtype)
                         ),
                         attention_mask=output.attention_mask.to(self._device),
                     )
-                )
-                del hidden_states, attention_mask
-                cleanup_memory()
+                del output, hidden_states, attention_mask
+                with profile_section(f"prompt_encoder.embeddings_cleanup.{raw_index}", self._embeddings_processor_device):
+                    cleanup_memory()
+                if self._tp_prompt_rank0_only:
+                    broadcast_tensor(prompt_output.video_encoding, device=self._device, src=0)
+                    broadcast_tensor(prompt_output.audio_encoding, device=self._device, src=0)
+                    broadcast_tensor(prompt_output.attention_mask, device=self._device, src=0)
+                result.append(prompt_output)
+        with profile_section("prompt_encoder.final_cleanup", self._device):
+            cleanup_memory()
         logger.info("Prompt encoding complete")
         return result
 
@@ -849,7 +962,17 @@ class VideoUpsampler:
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
             registry=registry or DummyRegistry(),
         )
-        module_ops = (build_hccl_upsampler_tensor_parallel_op(device=self._device),) if tensor_parallel else ()
+        use_tp_upsampler = tensor_parallel and os.getenv("LTX2_DISABLE_TP_UPSAMPLER", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        module_ops = (build_hccl_upsampler_tensor_parallel_op(device=self._device),) if use_tp_upsampler else ()
+        if tensor_parallel and not use_tp_upsampler:
+            logger.warning(
+                "LTX2_DISABLE_TP_UPSAMPLER is set; running full-replica NPU upsampler on every rank for diagnostics"
+            )
         self._upsampler_builder = Builder(
             model_path=upsampler_path,
             model_class_configurator=LatentUpsamplerConfigurator,
@@ -862,23 +985,28 @@ class VideoUpsampler:
         logger.info("Building video encoder + spatial upsampler from %s", self._upsampler_path)
         if self._resident:
             if self._resident_encoder is None:
-                self._resident_encoder = self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()
+                with profile_section("video_upsampler.encoder_build", self._device):
+                    self._resident_encoder = self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()
             if self._resident_upsampler is None:
-                self._resident_upsampler = self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval()
-            return upsample_video(latent=latent, video_encoder=self._resident_encoder, upsampler=self._resident_upsampler)
+                with profile_section("video_upsampler.upsampler_build", self._device):
+                    self._resident_upsampler = self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval()
+            with profile_section("video_upsampler.upsample", self._device):
+                return upsample_video(latent=latent, video_encoder=self._resident_encoder, upsampler=self._resident_upsampler)
+        with profile_section("video_upsampler.encoder_build", self._device):
+            encoder = self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()
+        with profile_section("video_upsampler.upsampler_build", self._device):
+            upsampler = self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval()
         with (
-            gpu_model(self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as encoder,
-            gpu_model(self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval()) as upsampler,
+            _profiled_gpu_model(encoder, teardown_profile="video_upsampler.encoder_teardown") as encoder,
+            _profiled_gpu_model(upsampler, teardown_profile="video_upsampler.upsampler_teardown") as upsampler,
         ):
-            return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
+            with profile_section("video_upsampler.upsample", self._device):
+                return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
 
     def distributed_tensor_parallel(self, latent: torch.Tensor | None) -> torch.Tensor | None:
         """Run latent upsampling with the HCCL tensor-parallel upsampler wrapper."""
-        if not self._tensor_parallel:
-            if latent is None:
-                raise ValueError("latent is required when upsampler is not tensor-parallel")
-            return self(latent)
-        latent = broadcast_tensor(latent if is_rank0() else None, device=self._device)
+        if latent is None:
+            raise ValueError("latent is required for tensor-parallel upsampling on every rank")
         return self(latent)
 
 
@@ -930,10 +1058,26 @@ class VideoDecoder:
         latent = latent.to(device=self._device, dtype=self._dtype)
         if self._resident:
             if self._resident_decoder is None:
-                self._resident_decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
-            return _dump_first_chunk(self._resident_decoder.decode_video(latent, tiling_config, generator))
-        decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
-        return _cleanup_iter(_dump_first_chunk(decoder.decode_video(latent, tiling_config, generator)), decoder)
+                with profile_section("video_decoder.build", self._device):
+                    self._resident_decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
+            chunks = self._resident_decoder.decode_video(latent, tiling_config, generator)
+            chunks = _maybe_autocast_iter(
+                chunks,
+                self._device,
+                env_name=_VIDEO_DECODER_AUTOCAST_ENV,
+                scope="video decoder",
+            )
+            return _dump_first_chunk(chunks)
+        with profile_section("video_decoder.build", self._device):
+            decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
+        chunks = decoder.decode_video(latent, tiling_config, generator)
+        chunks = _maybe_autocast_iter(
+            chunks,
+            self._device,
+            env_name=_VIDEO_DECODER_AUTOCAST_ENV,
+            scope="video decoder",
+        )
+        return _cleanup_iter(_dump_first_chunk(chunks), decoder)
 
 
 # ---------------------------------------------------------------------------
@@ -974,17 +1118,26 @@ class AudioDecoder:
     def __call__(self, latent: torch.Tensor) -> Audio:
         """Decode audio *latent* through VAE decoder + vocoder, then free both."""
         logger.info("Building audio decoder + vocoder from %s", self._checkpoint_path)
+        latent = latent.to(device=self._device, dtype=self._dtype)
         if self._resident:
             if self._resident_decoder is None:
-                self._resident_decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
+                with profile_section("audio_decode.decoder_build", self._device):
+                    self._resident_decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
             if self._resident_vocoder is None:
-                self._resident_vocoder = self._vocoder_builder.build(device=self._device, dtype=self._dtype).eval()
-            return vae_decode_audio(latent, self._resident_decoder, self._resident_vocoder)
+                with profile_section("audio_decode.vocoder_build", self._device):
+                    self._resident_vocoder = self._vocoder_builder.build(device=self._device, dtype=self._dtype).eval()
+            with profile_section("audio_decode.decode", self._device):
+                return vae_decode_audio(latent, self._resident_decoder, self._resident_vocoder)
+        with profile_section("audio_decode.decoder_build", self._device):
+            decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
+        with profile_section("audio_decode.vocoder_build", self._device):
+            vocoder = self._vocoder_builder.build(device=self._device, dtype=self._dtype).eval()
         with (
-            gpu_model(self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()) as decoder,
-            gpu_model(self._vocoder_builder.build(device=self._device, dtype=self._dtype).eval()) as vocoder,
+            _profiled_gpu_model(decoder, teardown_profile="audio_decode.decoder_teardown") as decoder,
+            _profiled_gpu_model(vocoder, teardown_profile="audio_decode.vocoder_teardown") as vocoder,
         ):
-            return vae_decode_audio(latent, decoder, vocoder)
+            with profile_section("audio_decode.decode", self._device):
+                return vae_decode_audio(latent, decoder, vocoder)
 
 
 # ---------------------------------------------------------------------------

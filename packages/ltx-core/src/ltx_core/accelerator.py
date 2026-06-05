@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import os
 import shutil
 import subprocess
@@ -18,6 +19,8 @@ except Exception:
 HCCS_GROUPS: tuple[tuple[int, ...], ...] = ((0, 1, 2, 3), (4, 5, 6, 7))
 DEFAULT_DTYPE = torch.float16
 _COMPILE_MODE_CONFIGURED = False
+_KERNEL_INCLUDE_CONFIGURED = False
+_KERNEL_INCLUDE_DIRS: tuple[str, ...] = ()
 _REMEDIATION = (
     "Source the CANN environment for this installation, for example "
     "`source /usr/local/Ascend/cann-9.0.0/set_env.sh`, and ensure torch_npu "
@@ -35,11 +38,108 @@ class AcceleratorInfo:
     device_count: int
 
 
+def _split_env_path(value: str) -> list[str]:
+    return [part for part in value.split(os.pathsep) if part]
+
+
+def _append_env_paths(name: str, paths: list[str]) -> None:
+    current = _split_env_path(os.environ.get(name, ""))
+    seen = {str(Path(part).resolve()) for part in current if Path(part).exists()}
+    additions: list[str] = []
+    for path in paths:
+        try:
+            resolved = str(Path(path).resolve())
+        except OSError:
+            resolved = path
+        if resolved not in seen:
+            additions.append(path)
+            seen.add(resolved)
+    if additions:
+        os.environ[name] = os.pathsep.join([*current, *additions])
+
+
+def _gcc_cxx_include_dirs() -> list[str]:
+    candidates: list[Path] = []
+    try:
+        proc = subprocess.run(
+            ["g++", "-print-file-name=include"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        include_dir = Path(proc.stdout.strip())
+        if include_dir.exists():
+            # .../lib/gcc/<triple>/<version>/include -> version and triple stdlib dirs.
+            version = include_dir.name
+            triple = include_dir.parent.name
+            candidates.extend(
+                [
+                    Path("/usr/include/c++") / version,
+                    Path("/usr/include") / triple / "c++" / version,
+                    Path("/usr/include") / triple,
+                    Path("/usr/include"),
+                    include_dir,
+                ]
+            )
+    except Exception:
+        pass
+
+    candidates.extend(sorted(Path("/usr/include/c++").glob("*"), reverse=True))
+    candidates.extend(sorted(Path("/usr/include").glob("*-linux-gnu/c++/*"), reverse=True))
+    candidates.extend(sorted(Path("/usr/include").glob("*-linux-gnu"), reverse=True))
+    candidates.append(Path("/usr/include"))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(str(path))
+    return unique
+
+
+def configure_ascend_kernel_includes() -> tuple[str, ...]:
+    """Make system C++ headers visible to AscendC single-op compilation.
+
+    Some CANN/AscendC kernels are JIT-compiled on first use.  On the deployment
+    image used here, the AscendC compiler can fail with ``fatal error: 'cstdint'
+    file not found`` unless the host C++ standard-library include paths are
+    visible.  Appending discovered system include dirs is a no-op for already
+    configured shells and keeps user-provided values intact.
+    """
+    global _KERNEL_INCLUDE_CONFIGURED, _KERNEL_INCLUDE_DIRS
+    if _KERNEL_INCLUDE_CONFIGURED:
+        return _KERNEL_INCLUDE_DIRS
+
+    dirs = _gcc_cxx_include_dirs()
+    if dirs:
+        _append_env_paths("CPLUS_INCLUDE_PATH", dirs)
+        # Some AscendC build helpers respect CXXFLAGS rather than
+        # CPLUS_INCLUDE_PATH.  Keep any explicit flags and append missing -I's.
+        current_flags = os.environ.get("CXXFLAGS", "")
+        existing_flags = set(current_flags.split())
+        additions = [f"-I{path}" for path in dirs if f"-I{path}" not in existing_flags]
+        if additions:
+            os.environ["CXXFLAGS"] = " ".join(part for part in [current_flags, *additions] if part)
+    _KERNEL_INCLUDE_DIRS = tuple(dirs)
+    _KERNEL_INCLUDE_CONFIGURED = True
+    return _KERNEL_INCLUDE_DIRS
+
+
 def configure_npu_runtime(device_index: int | None = None) -> None:
     global _COMPILE_MODE_CONFIGURED
     if torch_npu is None or not hasattr(torch, "npu"):
         return
     os.environ.setdefault("ENABLE_ACLNN", "true")
+    configure_ascend_kernel_includes()
     if not _COMPILE_MODE_CONFIGURED:
         torch.npu.set_compile_mode(jit_compile=False)
         _COMPILE_MODE_CONFIGURED = True
@@ -97,6 +197,17 @@ def _tbe_pythonpath_status() -> tuple[str, str | None]:
     return "OK", None
 
 
+def _custom_streaming_attention_status() -> str:
+    try:
+        module = importlib.import_module("ltx2_ascend_ops.streaming_attention")
+    except Exception as exc:
+        return f"unavailable ({_format_exc(exc)})"
+    try:
+        return module.availability_report()
+    except Exception as exc:
+        return f"unavailable ({_format_exc(exc)})"
+
+
 def npu_runtime_diagnostics(device_index: int = 0) -> list[str]:
     """Return human-readable diagnostics for the Ascend NPU runtime."""
     lines: list[str] = []
@@ -110,6 +221,8 @@ def npu_runtime_diagnostics(device_index: int = 0) -> list[str]:
     else:
         lines.append("ERROR torch.npu=missing")
 
+    kernel_include_dirs = configure_ascend_kernel_includes() if torch_npu is not None and hasattr(torch, "npu") else ()
+
     for name in ("ASCEND_HOME_PATH", "ASCEND_OPP_PATH", "ENABLE_ACLNN"):
         value = os.environ.get(name, "")
         status = "OK" if value else "WARN"
@@ -119,7 +232,14 @@ def npu_runtime_diagnostics(device_index: int = 0) -> list[str]:
     tbe_path_status, tbe_path_detail = _tbe_pythonpath_status()
     tbe_path_message = "CANN Python paths preserved" if tbe_path_detail is None else tbe_path_detail
     lines.append(f"{tbe_path_status} cann_pythonpath={tbe_path_message}")
+    if kernel_include_dirs:
+        has_cstdint = any((Path(path) / "cstdint").exists() for path in kernel_include_dirs)
+        status = "OK" if has_cstdint else "WARN"
+        lines.append(f"{status} ascendc_kernel_includes={os.pathsep.join(kernel_include_dirs)}")
+    else:
+        lines.append("WARN ascendc_kernel_includes=not found")
 
+    lines.append(f"INFO custom_streaming_attention={_custom_streaming_attention_status()}")
     lines.append("INFO npu_jit_compile=false")
 
     if torch_npu is not None and hasattr(torch, "npu"):
@@ -244,6 +364,10 @@ def environment_report(device_index: int = 0) -> str:
         f"ASCEND_HOME_PATH={os.environ.get('ASCEND_HOME_PATH', '')}",
         f"ASCEND_OPP_PATH={os.environ.get('ASCEND_OPP_PATH', '')}",
         f"ENABLE_ACLNN={os.environ.get('ENABLE_ACLNN', '')}",
+        f"CPLUS_INCLUDE_PATH={_env_snippet('CPLUS_INCLUDE_PATH')}",
+        f"CXXFLAGS={os.environ.get('CXXFLAGS', '')}",
+        f"ascendc_kernel_includes={os.pathsep.join(configure_ascend_kernel_includes())}",
+        f"custom_streaming_attention={_custom_streaming_attention_status()}",
     ]
     npu_smi = shutil.which("npu-smi")
     if npu_smi:

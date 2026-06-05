@@ -1,6 +1,7 @@
 import math
 import os
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -277,30 +278,45 @@ class MultiModalGuider:
         """
         fp32 = fp32_guidance_enabled() and cond.is_floating_point()
         orig_dtype = cond.dtype
-        if fp32:
-            cond = cond.to(torch.float32)
-            uncond_text = uncond_text.to(torch.float32) if torch.is_tensor(uncond_text) else uncond_text
-            uncond_perturbed = (
-                uncond_perturbed.to(torch.float32) if torch.is_tensor(uncond_perturbed) else uncond_perturbed
-            )
-            uncond_modality = (
-                uncond_modality.to(torch.float32) if torch.is_tensor(uncond_modality) else uncond_modality
-            )
-
-        pred = (
-            cond
-            + (self.params.cfg_scale - 1) * (cond - uncond_text)
-            + self.params.stg_scale * (cond - uncond_perturbed)
-            + (self.params.modality_scale - 1) * (cond - uncond_modality)
+        autocast_ctx = (
+            torch.autocast(device_type="npu", enabled=False)
+            if fp32 and cond.device.type == "npu"
+            else nullcontext()
         )
+        with autocast_ctx:
+            if fp32:
+                cond = cond.to(torch.float32)
+                uncond_text = uncond_text.to(torch.float32) if torch.is_tensor(uncond_text) else uncond_text
+                uncond_perturbed = (
+                    uncond_perturbed.to(torch.float32) if torch.is_tensor(uncond_perturbed) else uncond_perturbed
+                )
+                uncond_modality = (
+                    uncond_modality.to(torch.float32) if torch.is_tensor(uncond_modality) else uncond_modality
+                )
 
-        if self.params.rescale_scale != 0:
-            factor = cond.std() / pred.std()
-            factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
-            pred = pred * factor
+            pred = (
+                cond
+                + (self.params.cfg_scale - 1) * (cond - uncond_text)
+                + self.params.stg_scale * (cond - uncond_perturbed)
+                + (self.params.modality_scale - 1) * (cond - uncond_modality)
+            )
 
-        if fp32:
-            pred = pred.to(orig_dtype)
+            if self.params.rescale_scale != 0:
+                # torch.std dispatches to aclnnStd, which is unsupported on some Ascend
+                # CANN/firmware combinations. Compute the scalar standard deviation via
+                # mean-square reductions instead; this keeps the full guidance tensor on
+                # device while avoiding the unsupported Std kernel.
+                cond_centered = cond - cond.mean()
+                pred_centered = pred - pred.mean()
+                eps = torch.finfo(pred.dtype).eps if pred.is_floating_point() else 1e-12
+                cond_std = torch.sqrt((cond_centered * cond_centered).mean().clamp_min(eps))
+                pred_std = torch.sqrt((pred_centered * pred_centered).mean().clamp_min(eps))
+                factor = cond_std / pred_std
+                factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
+                pred = pred * factor
+
+            if fp32:
+                pred = pred.to(orig_dtype)
 
         return pred
 
