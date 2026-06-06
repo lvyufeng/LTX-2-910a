@@ -173,11 +173,13 @@ class HCCLTensorParallelAttention(torch.nn.Module):
         rank: int,
         world_size: int,
         device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.process_group = process_group
         self.heads = source.heads
         self.dim_head = source.dim_head
         self.local_heads = self.heads // world_size
@@ -233,7 +235,7 @@ class HCCLTensorParallelAttention(torch.nn.Module):
     def _global_rms_norm(self, value: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         square_sum = value.float().pow(2).sum(dim=-1, keepdim=True)
         with _profile_detail("tp_attn.rms_norm.all_reduce", value.device):
-            dist.all_reduce(square_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(square_sum, op=dist.ReduceOp.SUM, group=self.process_group)
         scale = torch.rsqrt(square_sum / self.inner_dim + self.norm_eps).to(dtype=value.dtype)
         return value * scale * weight
 
@@ -247,20 +249,36 @@ class HCCLTensorParallelAttention(torch.nn.Module):
         Tensor-parallel q/k RMSNorm needs a global square-sum over the sharded
         hidden dimension.  q and k usually have identical ``(B,T)`` prefixes in
         self-attention, so their two scalar square-sum tensors can be concatenated
-        and reduced with one ``all_reduce`` launch.  Cross-attention or any shape
-        mismatch falls back to the separate exact path.
+        along the last dimension.  Cross-attention has different q/k sequence
+        lengths; pack its flattened square-sum tensors instead, still using one
+        exact ``all_reduce`` launch.
         """
-        if q.shape[:-1] != k.shape[:-1]:
-            return (
-                self._global_rms_norm(q, self.q_norm_weight),
-                self._global_rms_norm(k, self.k_norm_weight),
-            )
-
         q_square_sum = q.float().pow(2).sum(dim=-1, keepdim=True)
         k_square_sum = k.float().pow(2).sum(dim=-1, keepdim=True)
+
+        if q.shape[:-1] != k.shape[:-1]:
+            # Cross-attention has different q/k sequence lengths, so the cheap
+            # same-shape concat path below cannot be used directly.  The two
+            # reductions are still mathematically independent elementwise sums,
+            # so flatten and pack them into one HCCL all_reduce launch, then
+            # split back to the original prefix shapes.  This preserves the exact
+            # RMSNorm formula while removing one collective launch per cross-attn
+            # q/k normalization.
+            q_numel = q_square_sum.numel()
+            q_shape = q_square_sum.shape
+            k_shape = k_square_sum.shape
+            square_sums = torch.cat((q_square_sum.reshape(-1), k_square_sum.reshape(-1)), dim=0)
+            with _profile_detail("tp_attn.rms_norm_pair_packed.all_reduce", q.device):
+                dist.all_reduce(square_sums, op=dist.ReduceOp.SUM, group=self.process_group)
+            q_square_sum = square_sums[:q_numel].view(q_shape)
+            k_square_sum = square_sums[q_numel:].view(k_shape)
+            q_scale = torch.rsqrt(q_square_sum / self.inner_dim + self.norm_eps).to(dtype=q.dtype)
+            k_scale = torch.rsqrt(k_square_sum / self.inner_dim + self.norm_eps).to(dtype=k.dtype)
+            return q * q_scale * self.q_norm_weight, k * k_scale * self.k_norm_weight
+
         square_sums = torch.cat((q_square_sum, k_square_sum), dim=-1)
         with _profile_detail("tp_attn.rms_norm_pair.all_reduce", q.device):
-            dist.all_reduce(square_sums, op=dist.ReduceOp.SUM)
+            dist.all_reduce(square_sums, op=dist.ReduceOp.SUM, group=self.process_group)
         q_scale = torch.rsqrt(square_sums[..., :1] / self.inner_dim + self.norm_eps).to(dtype=q.dtype)
         k_scale = torch.rsqrt(square_sums[..., 1:] / self.inner_dim + self.norm_eps).to(dtype=k.dtype)
         return q * q_scale * self.q_norm_weight, k * k_scale * self.k_norm_weight
@@ -364,16 +382,19 @@ class HCCLTensorParallelAttention(torch.nn.Module):
                 b, t, _ = out.shape
                 out = out.view(b, t, self.local_heads, self.dim_head)
                 gates = 2.0 * torch.sigmoid(gate_logits)
-                out = out * gates.unsqueeze(-1)
+                if not torch.is_grad_enabled():
+                    out.mul_(gates.unsqueeze(-1))
+                else:
+                    out = out * gates.unsqueeze(-1)
                 out = out.view(b, t, self.local_inner_dim)
 
         with _profile_detail(f"tp_attn.{attn_kind}.out_proj", self.device):
             result = self.to_out(out)
         with _profile_detail(f"tp_attn.{attn_kind}.out_all_reduce", self.device):
-            dist.all_reduce(result, op=dist.ReduceOp.SUM)
+            dist.all_reduce(result, op=dist.ReduceOp.SUM, group=self.process_group)
         if self.out_bias is not None:
             with _profile_detail(f"tp_attn.{attn_kind}.out_bias", self.device):
-                result = result + self.out_bias
+                result.add_(self.out_bias)
         return result
 
 
@@ -385,8 +406,10 @@ class HCCLTensorParallelFeedForward(torch.nn.Module):
         rank: int,
         world_size: int,
         device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
+        self.process_group = process_group
         project_in = source.net[0]
         if not isinstance(project_in, GELUApprox):
             raise TypeError(f"unsupported feed-forward input module {type(project_in)!r}")
@@ -410,21 +433,55 @@ class HCCLTensorParallelFeedForward(torch.nn.Module):
         with _profile_detail("tp_ff.project_out", device):
             result = self.project_out(hidden)
         with _profile_detail("tp_ff.out_all_reduce", device):
-            dist.all_reduce(result, op=dist.ReduceOp.SUM)
+            dist.all_reduce(result, op=dist.ReduceOp.SUM, group=self.process_group)
         if self.out_bias is not None:
             with _profile_detail("tp_ff.out_bias", device):
-                result = result + self.out_bias
+                result.add_(self.out_bias)
         return result
 
 
-def _replace_attention(block: torch.nn.Module, name: str, rank: int, world_size: int, device: torch.device) -> None:
+def _replace_attention(
+    block: torch.nn.Module,
+    name: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    process_group: dist.ProcessGroup | None,
+) -> None:
     if hasattr(block, name):
-        setattr(block, name, HCCLTensorParallelAttention(getattr(block, name), rank=rank, world_size=world_size, device=device))
+        setattr(
+            block,
+            name,
+            HCCLTensorParallelAttention(
+                getattr(block, name),
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                process_group=process_group,
+            ),
+        )
 
 
-def _replace_feed_forward(block: torch.nn.Module, name: str, rank: int, world_size: int, device: torch.device) -> None:
+def _replace_feed_forward(
+    block: torch.nn.Module,
+    name: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    process_group: dist.ProcessGroup | None,
+) -> None:
     if hasattr(block, name):
-        setattr(block, name, HCCLTensorParallelFeedForward(getattr(block, name), rank=rank, world_size=world_size, device=device))
+        setattr(
+            block,
+            name,
+            HCCLTensorParallelFeedForward(
+                getattr(block, name),
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                process_group=process_group,
+            ),
+        )
 
 
 def apply_hccl_tensor_parallel(
@@ -433,13 +490,14 @@ def apply_hccl_tensor_parallel(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
 ) -> torch.nn.Module:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("HCCL tensor parallelism requires torch.distributed.init_process_group('hccl')")
-    rank = dist.get_rank() if rank is None else rank
-    world_size = dist.get_world_size() if world_size is None else world_size
+    rank = dist.get_rank(group=process_group) if rank is None else rank
+    world_size = dist.get_world_size(group=process_group) if world_size is None else world_size
     if device is None:
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
         device = torch.device("npu", local_rank)
     if world_size <= 1:
         return model.to(device)
@@ -449,14 +507,14 @@ def apply_hccl_tensor_parallel(
         return model.to(device)
 
     for block in blocks:
-        _replace_attention(block, "attn1", rank, world_size, device)
-        _replace_attention(block, "attn2", rank, world_size, device)
-        _replace_attention(block, "audio_attn1", rank, world_size, device)
-        _replace_attention(block, "audio_attn2", rank, world_size, device)
-        _replace_attention(block, "audio_to_video_attn", rank, world_size, device)
-        _replace_attention(block, "video_to_audio_attn", rank, world_size, device)
-        _replace_feed_forward(block, "ff", rank, world_size, device)
-        _replace_feed_forward(block, "audio_ff", rank, world_size, device)
+        _replace_attention(block, "attn1", rank, world_size, device, process_group)
+        _replace_attention(block, "attn2", rank, world_size, device, process_group)
+        _replace_attention(block, "audio_attn1", rank, world_size, device, process_group)
+        _replace_attention(block, "audio_attn2", rank, world_size, device, process_group)
+        _replace_attention(block, "audio_to_video_attn", rank, world_size, device, process_group)
+        _replace_attention(block, "video_to_audio_attn", rank, world_size, device, process_group)
+        _replace_feed_forward(block, "ff", rank, world_size, device, process_group)
+        _replace_feed_forward(block, "audio_ff", rank, world_size, device, process_group)
         block.to(device)
         gc.collect()
 
@@ -465,6 +523,7 @@ def apply_hccl_tensor_parallel(
     model.tensor_parallel_rank = rank
     model.tensor_parallel_world_size = world_size
     model.tensor_parallel_device = device
+    model.tensor_parallel_process_group = process_group
     return model
 
 
@@ -473,14 +532,22 @@ def build_hccl_tensor_parallel_op(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
+    label: str | None = None,
 ) -> ModuleOps:
-    label = f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
+    label = label or f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
 
     def matcher(model: torch.nn.Module) -> bool:
         return hasattr(model, "transformer_blocks")
 
     def mutator(model: torch.nn.Module) -> torch.nn.Module:
-        return apply_hccl_tensor_parallel(model, rank=rank, world_size=world_size, device=device)
+        return apply_hccl_tensor_parallel(
+            model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
 
     mutator._ltx2_post_load = True
     return ModuleOps(name=f"ascend_hccl_tensor_parallel_{label}", matcher=matcher, mutator=mutator)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import inspect
 import logging
 import os
 from collections.abc import Iterator
@@ -26,7 +27,7 @@ from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifi
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.debug import dump_tensor
 from ltx_core.distributed.hccl import (
-    all_gather_tensor,
+    HCCLGroup,
     broadcast_tensor,
     broadcast_tensor_like,
     is_distributed,
@@ -115,7 +116,9 @@ logger = logging.getLogger(__name__)
 
 _EXPERIMENTAL_PRECISION_ENV = "LTX2_ASCEND_EXPERIMENTAL_PRECISION"
 _VIDEO_DECODER_AUTOCAST_ENV = "LTX2_ASCEND_VIDEO_DECODER_AUTOCAST"
+_PROMPT_EMBEDDINGS_CACHE_ENV = "LTX2_PROMPT_EMBEDDINGS_CACHE"
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_FALSY_ENV_VALUES = {"0", "false", "no", "off"}
 _LOGGED_EXPERIMENTAL_PRECISION_SCOPES: set[str] = set()
 
 T = TypeVar("T")
@@ -129,6 +132,53 @@ _M = TypeVar("_M", bound=torch.nn.Module)
 
 def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in _TRUTHY_ENV_VALUES
+
+
+def _env_disabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in _FALSY_ENV_VALUES
+
+
+def _prompt_embeddings_cache_enabled() -> bool:
+    return not _env_disabled(_PROMPT_EMBEDDINGS_CACHE_ENV)
+
+
+def _prompt_embeddings_cache_key(
+    prompts: list[str],
+    *,
+    enhance_first_prompt: bool,
+    enhance_prompt_image: str | None,
+    enhance_prompt_seed: int,
+    dtype: torch.dtype,
+    text_encoder_dtype: torch.dtype,
+    embeddings_processor_dtype: torch.dtype,
+    device: torch.device,
+    text_encoder_device: torch.device,
+    embeddings_processor_device: torch.device,
+) -> tuple[object, ...]:
+    return (
+        tuple(prompts),
+        bool(enhance_first_prompt),
+        enhance_prompt_image if enhance_first_prompt else None,
+        int(enhance_prompt_seed) if enhance_first_prompt else None,
+        str(dtype),
+        str(text_encoder_dtype),
+        str(embeddings_processor_dtype),
+        str(device),
+        str(text_encoder_device),
+        str(embeddings_processor_device),
+    )
+
+
+def _clone_prompt_output(output: EmbeddingsProcessorOutput) -> EmbeddingsProcessorOutput:
+    return EmbeddingsProcessorOutput(
+        video_encoding=output.video_encoding.clone(),
+        audio_encoding=None if output.audio_encoding is None else output.audio_encoding.clone(),
+        attention_mask=output.attention_mask.clone(),
+    )
+
+
+def _clone_prompt_outputs(outputs: tuple[EmbeddingsProcessorOutput, ...]) -> list[EmbeddingsProcessorOutput]:
+    return [_clone_prompt_output(output) for output in outputs]
 
 
 def _experimental_precision_enabled(name: str) -> bool:
@@ -237,31 +287,39 @@ def _build_state(
     return state
 
 
-def _broadcast_state(state: LatentState | None, device: torch.device) -> LatentState | None:
-    latent = broadcast_tensor(None if state is None else state.latent, device=device)
+def _group_src(group: HCCLGroup | None) -> int:
+    return group.leader_global_rank if group is not None else 0
+
+
+def _broadcast_state(state: LatentState | None, device: torch.device, group: HCCLGroup | None = None) -> LatentState | None:
+    src = _group_src(group)
+    latent = broadcast_tensor(None if state is None else state.latent, device=device, src=src, group=group)
     if latent is None:
         return None
     return LatentState(
         latent=latent,
-        denoise_mask=broadcast_tensor(state.denoise_mask if state is not None else None, device=device),
-        positions=broadcast_tensor(state.positions if state is not None else None, device=device),
-        clean_latent=broadcast_tensor(state.clean_latent if state is not None else None, device=device),
-        attention_mask=broadcast_tensor(None if state is None else state.attention_mask, device=device),
+        denoise_mask=broadcast_tensor(state.denoise_mask if state is not None else None, device=device, src=src, group=group),
+        positions=broadcast_tensor(state.positions if state is not None else None, device=device, src=src, group=group),
+        clean_latent=broadcast_tensor(state.clean_latent if state is not None else None, device=device, src=src, group=group),
+        attention_mask=broadcast_tensor(None if state is None else state.attention_mask, device=device, src=src, group=group),
     )
 
 
-def _broadcast_bool(value: bool, device: torch.device) -> bool:
-    flag = torch.tensor([1 if value else 0], device=device, dtype=torch.int64) if is_rank0() else None
-    flag = broadcast_tensor_like(flag, shape=(1,), dtype=torch.int64, device=device)
+def _broadcast_bool(value: bool, device: torch.device, group: HCCLGroup | None = None) -> bool:
+    src = _group_src(group)
+    flag = torch.tensor([1 if value else 0], device=device, dtype=torch.int64) if is_rank0(group) else None
+    flag = broadcast_tensor_like(flag, shape=(1,), dtype=torch.int64, device=device, src=src, group=group)
     return bool(flag.item())
 
 
-def _sync_state_latent(state: LatentState, device: torch.device) -> LatentState:
+def _sync_state_latent(state: LatentState, device: torch.device, group: HCCLGroup | None = None) -> LatentState:
     latent = broadcast_tensor_like(
-        state.latent if is_rank0() else None,
+        state.latent if is_rank0(group) else None,
         shape=state.latent.shape,
         dtype=state.latent.dtype,
         device=device,
+        src=_group_src(group),
+        group=group,
     )
     return replace(state, latent=latent)
 
@@ -272,13 +330,14 @@ def _build_state_with_synchronized_noise(
     noiser: Noiser,
     dtype: torch.dtype,
     device: torch.device,
+    group: HCCLGroup | None = None,
 ) -> LatentState:
-    """Build state on all ranks but draw random noise only on rank 0."""
+    """Build state on all ranks but draw random noise only on the TP group leader."""
     state = tools.create_initial_state(device, dtype, spec.initial_latent)
     state = state_with_conditionings(state, spec.conditionings, tools)
-    if is_rank0():
+    if is_rank0(group):
         state = noiser(state, spec.noise_scale)
-    state = _sync_state_latent(state, device)
+    state = _sync_state_latent(state, device, group)
     if spec.frozen:
         state = replace(state, denoise_mask=torch.zeros_like(state.denoise_mask))
     return state
@@ -362,6 +421,7 @@ class DiffusionStage:
         layerwise_devices: list[torch.device] | None = None,
         tensor_parallel: bool = False,
         resident: bool = False,
+        tensor_parallel_group: HCCLGroup | None = None,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
@@ -389,13 +449,23 @@ class DiffusionStage:
                 registry=registry or DummyRegistry(),
             )
         self._tensor_parallel = tensor_parallel
+        self._tensor_parallel_group = tensor_parallel_group
         if tensor_parallel:
             if not is_npu_device(device):
                 raise ValueError("HCCL tensor parallelism requires an Ascend NPU device")
-            if not is_distributed() or world_size() <= 1:
+            if not is_distributed() or world_size(tensor_parallel_group) <= 1:
                 raise ValueError("HCCL tensor parallelism requires torchrun with world_size > 1")
             self._transformer_builder = self._transformer_builder.with_module_ops(
-                (*self._transformer_builder.module_ops, build_hccl_tensor_parallel_op(device=device))
+                (
+                    *self._transformer_builder.module_ops,
+                    build_hccl_tensor_parallel_op(
+                        rank=rank(tensor_parallel_group),
+                        world_size=world_size(tensor_parallel_group),
+                        device=device,
+                        process_group=tensor_parallel_group.process_group if tensor_parallel_group is not None else None,
+                        label=tensor_parallel_group.name if tensor_parallel_group is not None else None,
+                    ),
+                )
             )
         if layerwise_devices is not None and len(layerwise_devices) > 1:
             if tensor_parallel:
@@ -548,14 +618,21 @@ class DiffusionStage:
                 video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
                 has_conditionings = bool(video.conditionings)
                 if self._tensor_parallel:
-                    has_conditionings = _broadcast_bool(has_conditionings, self._device)
+                    has_conditionings = _broadcast_bool(has_conditionings, self._device, self._tensor_parallel_group)
                 if self._tensor_parallel and not has_conditionings:
-                    video_state = _build_state_with_synchronized_noise(video, video_tools, noiser, self._dtype, self._device)
+                    video_state = _build_state_with_synchronized_noise(
+                        video,
+                        video_tools,
+                        noiser,
+                        self._dtype,
+                        self._device,
+                        self._tensor_parallel_group,
+                    )
                 else:
-                    if not self._tensor_parallel or is_rank0():
+                    if not self._tensor_parallel or is_rank0(self._tensor_parallel_group):
                         video_state = _build_state(video, video_tools, noiser, self._dtype, self._device)
                     if self._tensor_parallel:
-                        video_state = _broadcast_state(video_state, self._device)
+                        video_state = _broadcast_state(video_state, self._device, self._tensor_parallel_group)
 
         audio_state: LatentState | None = None
         audio_tools: LatentTools | None = None
@@ -565,14 +642,21 @@ class DiffusionStage:
                 audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
                 has_conditionings = bool(audio.conditionings)
                 if self._tensor_parallel:
-                    has_conditionings = _broadcast_bool(has_conditionings, self._device)
+                    has_conditionings = _broadcast_bool(has_conditionings, self._device, self._tensor_parallel_group)
                 if self._tensor_parallel and not has_conditionings:
-                    audio_state = _build_state_with_synchronized_noise(audio, audio_tools, noiser, self._dtype, self._device)
+                    audio_state = _build_state_with_synchronized_noise(
+                        audio,
+                        audio_tools,
+                        noiser,
+                        self._dtype,
+                        self._device,
+                        self._tensor_parallel_group,
+                    )
                 else:
-                    if not self._tensor_parallel or is_rank0():
+                    if not self._tensor_parallel or is_rank0(self._tensor_parallel_group):
                         audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
                     if self._tensor_parallel:
-                        audio_state = _broadcast_state(audio_state, self._device)
+                        audio_state = _broadcast_state(audio_state, self._device, self._tensor_parallel_group)
 
         if video_state is not None:
             dump_tensor("diffusion_stage.initial_video_latent", video_state.latent)
@@ -580,6 +664,9 @@ class DiffusionStage:
             dump_tensor("diffusion_stage.initial_audio_latent", audio_state.latent)
 
         wrapped = BatchSplitAdapter(transformer, max_batch_size=max_batch_size)  # type: ignore[arg-type]
+        effective_loop_kwargs = dict(loop_kwargs or {})
+        if self._tensor_parallel and "tp_group" in inspect.signature(loop).parameters:
+            effective_loop_kwargs.setdefault("tp_group", self._tensor_parallel_group)
         with profile_section("diffusion_stage.loop", self._device):
             video_state, audio_state = loop(
                 sigmas=sigmas,
@@ -588,7 +675,7 @@ class DiffusionStage:
                 stepper=stepper,
                 transformer=wrapped,
                 denoiser=denoiser,
-                **(loop_kwargs or {}),
+                **effective_loop_kwargs,
             )
 
         if video_state is not None:
@@ -691,6 +778,10 @@ class PromptEncoder:
         layerwise_devices: list[torch.device] | None = None,
         tensor_parallel: bool = False,
         resident: bool = False,
+        resident_text_encoder: bool | None = None,
+        resident_embeddings_processor: bool | None = None,
+        embeddings_processor_rank0_only: bool = False,
+        tensor_parallel_group: HCCLGroup | None = None,
     ) -> None:
         self._gemma_root = gemma_root
         self._checkpoint_path = checkpoint_path
@@ -700,9 +791,16 @@ class PromptEncoder:
         self._device = device
         self._text_encoder_device = text_encoder_device or device
         self._tensor_parallel = tensor_parallel
+        self._tensor_parallel_group = tensor_parallel_group
         self._resident = resident
+        self._resident_text_encoder_enabled = resident if resident_text_encoder is None else resident_text_encoder
+        self._resident_embeddings_processor_enabled = (
+            resident if resident_embeddings_processor is None else resident_embeddings_processor
+        )
+        self._embeddings_processor_rank0_only = embeddings_processor_rank0_only
         self._resident_text_encoder: torch.nn.Module | None = None
         self._resident_embeddings_processor: EmbeddingsProcessor | None = None
+        self._prompt_embeddings_cache: dict[tuple[object, ...], tuple[EmbeddingsProcessorOutput, ...]] = {}
         self._tp_prompt_rank0_only = (
             tensor_parallel
             and os.getenv("LTX2_TP_PROMPT_RANK0_ONLY", "").lower() in {"1", "true", "yes", "on"}
@@ -710,7 +808,7 @@ class PromptEncoder:
         if tensor_parallel:
             if not is_npu_device(device):
                 raise ValueError("Gemma HCCL tensor parallelism requires an Ascend NPU device")
-            if not is_distributed() or world_size() <= 1:
+            if not is_distributed() or world_size(tensor_parallel_group) <= 1:
                 raise ValueError("Gemma HCCL tensor parallelism requires torchrun with world_size > 1")
         if embeddings_processor_device is not None:
             self._embeddings_processor_device = embeddings_processor_device
@@ -732,7 +830,16 @@ class PromptEncoder:
             module_ops = (*module_ops_from_gemma_root(gemma_root), _gemma_output_dtype_op(self._text_encoder_dtype))
             disable_tp_text_encoder = os.getenv("LTX2_DISABLE_TP_TEXT_ENCODER", "").lower() in {"1", "true", "yes", "on"}
             if tensor_parallel and not disable_tp_text_encoder:
-                module_ops = (*module_ops, build_hccl_gemma_tensor_parallel_op(device=self._text_encoder_device))
+                module_ops = (
+                    *module_ops,
+                    build_hccl_gemma_tensor_parallel_op(
+                        rank=rank(tensor_parallel_group),
+                        world_size=world_size(tensor_parallel_group),
+                        device=self._text_encoder_device,
+                        process_group=tensor_parallel_group.process_group if tensor_parallel_group is not None else None,
+                        label=tensor_parallel_group.name if tensor_parallel_group is not None else None,
+                    ),
+                )
             elif layerwise_devices is not None and len(layerwise_devices) > 1:
                 module_ops = (*module_ops, build_gemma_layerwise_device_map_op(layerwise_devices))
             model_folder = find_matching_file(gemma_root, "model*.safetensors").parent
@@ -760,7 +867,15 @@ class PromptEncoder:
         # transformer TP path.  It is small enough to replicate; set
         # LTX2_TP_EMBEDDINGS_PROCESSOR=1 only for explicit experiments.
         if tensor_parallel and os.getenv("LTX2_TP_EMBEDDINGS_PROCESSOR", "").lower() in {"1", "true", "yes", "on"}:
-            embeddings_module_ops = (build_hccl_embeddings_processor_tensor_parallel_op(device=self._embeddings_processor_device),)
+            embeddings_module_ops = (
+                build_hccl_embeddings_processor_tensor_parallel_op(
+                    rank=rank(tensor_parallel_group),
+                    world_size=world_size(tensor_parallel_group),
+                    device=self._embeddings_processor_device,
+                    process_group=tensor_parallel_group.process_group if tensor_parallel_group is not None else None,
+                    label=tensor_parallel_group.name if tensor_parallel_group is not None else None,
+                ),
+            )
         elif is_npu_device(self._embeddings_processor_device):
             chunked = AscendChunkedAttention()
             embeddings_module_ops = (set_attention_module_op(chunked, chunked),)
@@ -791,7 +906,7 @@ class PromptEncoder:
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
             return _streaming_model(self._streaming_text_encoder_builder, self._offload_mode, self._text_encoder_device, self._text_encoder_dtype)
-        if self._resident:
+        if self._resident_text_encoder_enabled:
             if self._resident_text_encoder is None:
                 self._resident_text_encoder = self._build_text_encoder()
             return nullcontext(self._resident_text_encoder)
@@ -806,8 +921,26 @@ class PromptEncoder:
         enhance_prompt_seed: int = 42,
     ) -> list[EmbeddingsProcessorOutput]:
         """Encode *prompts* through Gemma -> embeddings processor, freeing each model after use."""
+        cache_key = _prompt_embeddings_cache_key(
+            prompts,
+            enhance_first_prompt=enhance_first_prompt,
+            enhance_prompt_image=enhance_prompt_image,
+            enhance_prompt_seed=enhance_prompt_seed,
+            dtype=self._dtype,
+            text_encoder_dtype=self._text_encoder_dtype,
+            embeddings_processor_dtype=self._embeddings_processor_dtype,
+            device=self._device,
+            text_encoder_device=self._text_encoder_device,
+            embeddings_processor_device=self._embeddings_processor_device,
+        )
+        cache_enabled = _prompt_embeddings_cache_enabled()
+        cached = self._prompt_embeddings_cache.get(cache_key) if cache_enabled else None
+        if cached is not None:
+            logger.info("Prompt embeddings cache hit")
+            return _clone_prompt_outputs(cached)
+
         raw_outputs = None
-        if self._tp_prompt_rank0_only and not is_rank0():
+        if self._tp_prompt_rank0_only and not is_rank0(self._tensor_parallel_group):
             logger.info("Skipping prompt text encoder on nonzero TP rank")
         else:
             logger.info("Building text encoder from %s", self._gemma_root)
@@ -835,12 +968,27 @@ class PromptEncoder:
             )
             return hidden_states, attention_mask.to(device=self._embeddings_processor_device)
 
-        if self._tp_prompt_rank0_only and not is_rank0():
+        if self._tp_prompt_rank0_only and not is_rank0(self._tensor_parallel_group):
             result = []
             for _ in prompts:
-                video_encoding = broadcast_tensor(None, device=self._device, src=0)
-                audio_encoding = broadcast_tensor(None, device=self._device, src=0)
-                attention_mask = broadcast_tensor(None, device=self._device, src=0)
+                video_encoding = broadcast_tensor(
+                    None,
+                    device=self._device,
+                    src=_group_src(self._tensor_parallel_group),
+                    group=self._tensor_parallel_group,
+                )
+                audio_encoding = broadcast_tensor(
+                    None,
+                    device=self._device,
+                    src=_group_src(self._tensor_parallel_group),
+                    group=self._tensor_parallel_group,
+                )
+                attention_mask = broadcast_tensor(
+                    None,
+                    device=self._device,
+                    src=_group_src(self._tensor_parallel_group),
+                    group=self._tensor_parallel_group,
+                )
                 result.append(
                     EmbeddingsProcessorOutput(
                         video_encoding=video_encoding,
@@ -849,10 +997,48 @@ class PromptEncoder:
                     )
                 )
             cleanup_memory()
+            if cache_enabled:
+                self._prompt_embeddings_cache.clear()
+                self._prompt_embeddings_cache[cache_key] = tuple(_clone_prompt_outputs(tuple(result)))
             logger.info("Prompt encoding received from rank0")
             return result
 
-        if self._resident:
+        if self._embeddings_processor_rank0_only and not is_rank0(self._tensor_parallel_group):
+            result = []
+            for _ in prompts:
+                video_encoding = broadcast_tensor(
+                    None,
+                    device=self._device,
+                    src=_group_src(self._tensor_parallel_group),
+                    group=self._tensor_parallel_group,
+                )
+                audio_encoding = broadcast_tensor(
+                    None,
+                    device=self._device,
+                    src=_group_src(self._tensor_parallel_group),
+                    group=self._tensor_parallel_group,
+                )
+                attention_mask = broadcast_tensor(
+                    None,
+                    device=self._device,
+                    src=_group_src(self._tensor_parallel_group),
+                    group=self._tensor_parallel_group,
+                )
+                result.append(
+                    EmbeddingsProcessorOutput(
+                        video_encoding=video_encoding,
+                        audio_encoding=audio_encoding,
+                        attention_mask=attention_mask,
+                    )
+                )
+            cleanup_memory()
+            if cache_enabled:
+                self._prompt_embeddings_cache.clear()
+                self._prompt_embeddings_cache[cache_key] = tuple(_clone_prompt_outputs(tuple(result)))
+            logger.info("Prompt embeddings received from rank0")
+            return result
+
+        if self._resident_embeddings_processor_enabled:
             if self._resident_embeddings_processor is None:
                 self._resident_embeddings_processor = self._build_embeddings_processor()
             embeddings_processor_ctx = nullcontext(self._resident_embeddings_processor)
@@ -878,13 +1064,31 @@ class PromptEncoder:
                 del output, hidden_states, attention_mask
                 with profile_section(f"prompt_encoder.embeddings_cleanup.{raw_index}", self._embeddings_processor_device):
                     cleanup_memory()
-                if self._tp_prompt_rank0_only:
-                    broadcast_tensor(prompt_output.video_encoding, device=self._device, src=0)
-                    broadcast_tensor(prompt_output.audio_encoding, device=self._device, src=0)
-                    broadcast_tensor(prompt_output.attention_mask, device=self._device, src=0)
+                if self._tp_prompt_rank0_only or self._embeddings_processor_rank0_only:
+                    broadcast_tensor(
+                        prompt_output.video_encoding,
+                        device=self._device,
+                        src=_group_src(self._tensor_parallel_group),
+                        group=self._tensor_parallel_group,
+                    )
+                    broadcast_tensor(
+                        prompt_output.audio_encoding,
+                        device=self._device,
+                        src=_group_src(self._tensor_parallel_group),
+                        group=self._tensor_parallel_group,
+                    )
+                    broadcast_tensor(
+                        prompt_output.attention_mask,
+                        device=self._device,
+                        src=_group_src(self._tensor_parallel_group),
+                        group=self._tensor_parallel_group,
+                    )
                 result.append(prompt_output)
         with profile_section("prompt_encoder.final_cleanup", self._device):
             cleanup_memory()
+        if cache_enabled:
+            self._prompt_embeddings_cache.clear()
+            self._prompt_embeddings_cache[cache_key] = tuple(_clone_prompt_outputs(tuple(result)))
         logger.info("Prompt encoding complete")
         return result
 
@@ -948,12 +1152,14 @@ class VideoUpsampler:
         registry: Registry | None = None,
         resident: bool = False,
         tensor_parallel: bool = False,
+        tensor_parallel_group: HCCLGroup | None = None,
     ) -> None:
         self._upsampler_path = upsampler_path
         self._dtype = dtype
         self._device = device
         self._resident = resident
         self._tensor_parallel = tensor_parallel
+        self._tensor_parallel_group = tensor_parallel_group
         self._resident_encoder: VideoEncoder | None = None
         self._resident_upsampler: torch.nn.Module | None = None
         self._encoder_builder = Builder(
@@ -968,7 +1174,19 @@ class VideoUpsampler:
             "yes",
             "on",
         }
-        module_ops = (build_hccl_upsampler_tensor_parallel_op(device=self._device),) if use_tp_upsampler else ()
+        module_ops = (
+            (
+                build_hccl_upsampler_tensor_parallel_op(
+                    rank=rank(tensor_parallel_group),
+                    world_size=world_size(tensor_parallel_group),
+                    device=self._device,
+                    process_group=tensor_parallel_group.process_group if tensor_parallel_group is not None else None,
+                    label=tensor_parallel_group.name if tensor_parallel_group is not None else None,
+                ),
+            )
+            if use_tp_upsampler
+            else ()
+        )
         if tensor_parallel and not use_tp_upsampler:
             logger.warning(
                 "LTX2_DISABLE_TP_UPSAMPLER is set; running full-replica NPU upsampler on every rank for diagnostics"

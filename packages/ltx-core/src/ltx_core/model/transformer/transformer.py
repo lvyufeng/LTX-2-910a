@@ -85,6 +85,32 @@ class TransformerOpsConfig:
 DEFAULT_TRANSFORMER_OPS = TransformerOpsConfig()
 
 
+def _residual_add(x: torch.Tensor, update: torch.Tensor, *, inplace: bool) -> torch.Tensor:
+    if inplace and not torch.is_grad_enabled():
+        x.add_(update)
+        return x
+    return x + update
+
+
+def _residual_mul_update(value: torch.Tensor, multiplier: torch.Tensor, *, inplace: bool) -> torch.Tensor:
+    if inplace and not torch.is_grad_enabled():
+        value.mul_(multiplier)
+        return value
+    return value * multiplier
+
+
+def _apply_adaln_modulation(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
+    if not torch.is_grad_enabled():
+        x.mul_(1 + scale)
+        x.add_(shift)
+        return x
+    return x * (1 + scale) + shift
+
+
+def _residual_addcmul(x: torch.Tensor, value: torch.Tensor, gate: torch.Tensor, *, inplace: bool) -> torch.Tensor:
+    return _residual_add(x, _residual_mul_update(value, gate, inplace=inplace), inplace=inplace)
+
+
 class BasicAVTransformerBlock(torch.nn.Module):
     def __init__(
         self,
@@ -289,7 +315,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.video.attn1_out", vx_msa_out)
-            vx = vx + vx_msa_out * vgate_msa
+            vx = _residual_addcmul(vx, vx_msa_out, vgate_msa, inplace=True)
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.video.after_attn1", vx)
             del vgate_msa, norm_vx, vx_msa_out
@@ -306,7 +332,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.video.attn2_out", video_attn2_out)
-            vx = vx + video_attn2_out
+            vx = _residual_add(vx, video_attn2_out, inplace=True)
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.video.after_attn2", vx)
             del video_attn2_out
@@ -329,7 +355,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.audio.attn1_out", ax_msa_out)
-            ax = ax + ax_msa_out * agate_msa
+            ax = _residual_addcmul(ax, ax_msa_out, agate_msa, inplace=True)
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.audio.after_attn1", ax)
             del agate_msa, norm_ax, ax_msa_out
@@ -346,7 +372,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             )
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.audio.attn2_out", audio_attn2_out)
-            ax = ax + audio_attn2_out
+            ax = _residual_add(ax, audio_attn2_out, inplace=True)
             if debug_ops:
                 dump_tensor(f"transformer.block.{debug_block}.audio.after_attn2", ax)
             del audio_attn2_out
@@ -390,10 +416,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.video.a2v_attn_out", a2v_out)
-                a2v_update = a2v_out * gate_out_a2v * video.cross_attn_perturbation_mask
+                a2v_update = _residual_mul_update(a2v_out, gate_out_a2v * video.cross_attn_perturbation_mask, inplace=True)
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.video.a2v_update", a2v_update)
-                vx = vx + a2v_update
+                vx = _residual_add(vx, a2v_update, inplace=not run_v2a)
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.video.after_a2v", vx)
                 del gate_out_a2v, a2v_vx_scaled, a2v_ax_scaled, a2v_out, a2v_update
@@ -430,10 +456,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 )
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.audio.v2a_attn_out", v2a_out)
-                v2a_update = v2a_out * gate_out_v2a * audio.cross_attn_perturbation_mask
+                v2a_update = _residual_mul_update(v2a_out, gate_out_v2a * audio.cross_attn_perturbation_mask, inplace=True)
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.audio.v2a_update", v2a_update)
-                ax = ax + v2a_update
+                ax = _residual_add(ax, v2a_update, inplace=True)
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.audio.after_v2a", ax)
                 del gate_out_v2a, v2a_ax_scaled, v2a_vx_scaled, v2a_out, v2a_update
@@ -463,10 +489,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     dump_tensor(f"{debug_prefix}.video.ff_update", ff_update)
                 vx = (vx.to(torch.float32) + ff_update).to(vx.dtype)
             else:
-                ff_update = ff_out * vgate_mlp
+                ff_update = _residual_mul_update(ff_out, vgate_mlp, inplace=True)
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.video.ff_update", ff_update)
-                vx = vx + ff_update
+                vx = _residual_add(vx, ff_update, inplace=True)
             if debug_ops:
                 dump_tensor(f"{debug_prefix}.video.after_ff", vx)
 
@@ -496,10 +522,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     dump_tensor(f"{debug_prefix}.audio.ff_update", audio_ff_update)
                 ax = (ax.to(torch.float32) + audio_ff_update).to(ax.dtype)
             else:
-                audio_ff_update = audio_ff_out * agate_mlp
+                audio_ff_update = _residual_mul_update(audio_ff_out, agate_mlp, inplace=True)
                 if debug_ops:
                     dump_tensor(f"{debug_prefix}.audio.ff_update", audio_ff_update)
-                ax = ax + audio_ff_update
+                ax = _residual_add(ax, audio_ff_update, inplace=True)
             if debug_ops:
                 dump_tensor(f"{debug_prefix}.audio.after_ff", ax)
 
@@ -526,6 +552,6 @@ def apply_cross_attention_adaln(
         prompt_scale_shift_table[None, None].to(device=x.device, dtype=x.dtype)
         + prompt_timestep.reshape(batch_size, prompt_timestep.shape[1], 2, -1)
     ).unbind(dim=2)
-    attn_input = rms_norm(x, eps=norm_eps) * (1 + q_scale) + q_shift
-    encoder_hidden_states = context * (1 + scale_kv) + shift_kv
-    return attn(attn_input, context=encoder_hidden_states, mask=context_mask) * q_gate
+    attn_input = _apply_adaln_modulation(rms_norm(x, eps=norm_eps), q_scale, q_shift)
+    encoder_hidden_states = _apply_adaln_modulation(context.clone() if not torch.is_grad_enabled() else context, scale_kv, shift_kv)
+    return _residual_mul_update(attn(attn_input, context=encoder_hidden_states, mask=context_mask), q_gate, inplace=True)

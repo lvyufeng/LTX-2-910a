@@ -6,12 +6,19 @@ pipelines with NPU-aware device/dtype defaults and HCCL tensor parallelism.
 
 ## Verified good path (do not regress)
 
-4-card HCCL tensor parallel, `two-stage-hq` (Res2s), `960x1664`, `121` frames,
-`24` fps, `15` HQ steps. Transformer runs fp16; **embeddings processor, video
-decoder, and audio decoder run fp32** (the CLI sets these fp32 defaults on NPU
-automatically). `LTX2_GUIDANCE_FP32=1`. Attention base chunk defaults to `1536`
-on the TP HQ path, with a scoped shape policy using chunk2048 only for the
-validated stage-2 long-K self-attention shape.
+8-card split-stage HCCL tensor parallel, `two-stage-hq` (Res2s), `960x1664`,
+`121` frames, `24` fps, `15` HQ steps, resident models, and repeat inference.
+Stage 1 runs as a 4-way TP subgroup on global ranks/devices `0,1,2,3`; stage 2,
+the spatial upsampler, and output run as a 4-way TP subgroup on ranks/devices
+`4,5,6,7`. Split-stage output defaults to the stage-2 leader, global rank `4`.
+
+Transformer runs fp16; **embeddings processor, guidance combine, video decoder,
+and audio decoder run fp32** (the CLI sets the fp32 decode/processor defaults on
+NPU automatically; use `LTX2_GUIDANCE_FP32=1` for the good path). Attention base
+chunk defaults to `1536` on the TP HQ path, with a scoped shape policy using
+chunk2048 only for the validated stage-2 long-K self-attention shape. Prompt
+embeddings are cached across repeated calls by default when all cache inputs
+match, which removes prompt re-encoding from resident repeat timing.
 
 Known-bad flags that corrupt output and must stay **off**: fp16/TP embeddings
 processor (`LTX2_TP_EMBEDDINGS_PROCESSOR`,
@@ -20,14 +27,39 @@ autocast (`LTX2_ASCEND_VIDEO_DECODER_AUTOCAST`,
 `LTX2_ASCEND_AUDIO_DECODER_LOWRES_AUTOCAST`), the experimental-precision master
 gate (`LTX2_ASCEND_EXPERIMENTAL_PRECISION`), rank0-only prompt
 (`LTX2_TP_PROMPT_RANK0_ONLY`), and disabling the TP text encoder
-(`LTX2_DISABLE_TP_TEXT_ENCODER`). Everything must run on NPU; no CPU execution
-on the good path.
+(`LTX2_DISABLE_TP_TEXT_ENCODER`). Tensor compute and large tensor handoff must
+stay on NPU/HCCL; host work is limited to control metadata, logging, timing, and
+repeat barriers.
+
+## Current measured performance
+
+Full-size validation target: `960x1664`, `121` frames, `24` fps, `15` HQ steps,
+8-card split-stage TP-HQ, resident models, no profiling instrumentation in the
+final timing run.
+
+| Path | Timing | Notes |
+|------|--------|-------|
+| Earlier split-stage resident baseline | run2 `323.14s` | After resident split-stage and exact transformer/runtime micro-optimizations. |
+| Current split-stage resident path | run1 `627.79s`, run2 `319.72s` | Prompt embeddings repeat cache enabled by default; repeated run avoids model rebuild and prompt re-encoding. |
+
+Profiled repeat-run breakdown after prompt caching:
+
+* rank0/stage1 diffusion loop: ~`193.26s`;
+* rank4/stage2 diffusion loop: ~`105.05s`;
+* prompt encoder repeat: ~`0.001s` after cache hit;
+* video upsampler and audio decode are negligible relative to transformer loops.
+
+Use this as the current performance baseline when evaluating future changes.
+Optimizations that improve speed without changing video/audio quality should stay
+default-on with explicit off switches where useful; slower, unsupported, unstable,
+or not-yet-full-size-validated changes must remain opt-in or out of tree.
 
 ## Runtime env knobs
 
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `LTX2_GUIDANCE_FP32` | unset | Run guidance math in fp32 (part of the good path). |
+| `LTX2_PROMPT_EMBEDDINGS_CACHE` | enabled | Cache the most recent prompt embeddings output in memory and return clones on matching repeated calls; set `0`/`off`/`false` to disable for debugging. |
 | `LTX2_ASCEND_ATTENTION` | unset (auto) | `eager`/`math` = chunked attention; `streaming`/`custom` = optional AscendC streaming attention for supported no-mask shapes with chunked fallback; `fused` = `npu_fusion_attention` (not viable on this host — see below). |
 | `LTX2_ASCEND_STREAMING_ATTN_MIN_T` | `1` | Minimum sequence length for the opt-in streaming attention dispatch. Smaller/unsupported shapes fall back to chunked attention. |
 | `LTX2_ASCEND_STREAMING_ATTN_FULL_MATMUL` | unset (on inside native) | Native streaming bring-up uses full-sequence QK/PV Matmul with validated `blockM=32` and segmented whole-row UB softmax (`4096` scores/segment); set `0`/`off` or `LTX2_ASCEND_STREAMING_ATTN_BLOCKED=1` to force the slower blocked online path. |
@@ -49,10 +81,17 @@ on the good path.
 ## Default-enabled TP optimizations
 
 These optimizations are enabled by default because they are mathematically exact
-and validated on the 4-card TP path. Per the project preference, performance
-wins with unchanged quality/stability should be defaults, with explicit fallback
-only where useful.
+and validated on the TP-HQ path. Per the project preference, performance wins
+with unchanged quality/stability should be defaults, with explicit fallback only
+where useful.
 
+* **8-card split-stage TP-HQ resident mode** — `--tp-stage-split 0,1,2,3:4,5,6,7`
+  builds stage-local 4-rank HCCL subgroups, keeps stage transformers resident
+  across repeats, and writes from the stage-2 leader by default.
+* **Prompt embeddings repeat cache** — default ON via `LTX2_PROMPT_EMBEDDINGS_CACHE`;
+  repeated calls with matching prompt/cache inputs reuse cloned NPU prompt
+  embeddings and avoid a second Gemma/embeddings-processor pass. Set the env to
+  `0` to disable.
 * **RoPE via CANN `npu_rotary_mul`** — default ON on NPU; force PyTorch fallback
   with `LTX2_ASCEND_ROPE=eager` (or `off`/`0`/`false`).
 * **q/k paired RoPE frequency duplication** — when q and k share the same RoPE

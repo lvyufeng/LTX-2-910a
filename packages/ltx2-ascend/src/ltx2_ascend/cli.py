@@ -56,11 +56,130 @@ _ASCEND_SOFTMAX_FP16_ENV = "LTX2_ASCEND_SOFTMAX_FP16"
 _ASCEND_TP_HQ_DEFAULT_SOFTMAX_FP16 = "1"
 _ASCEND_ATTENTION_ENV = "LTX2_ASCEND_ATTENTION"
 _ASCEND_ROPE_ENV = "LTX2_ASCEND_ROPE"
+_ASCEND_STATE_DICT_CACHE_ENV = "LTX2_ASCEND_STATE_DICT_CACHE"
+_ASCEND_STATE_DICT_CACHE_CHOICES = ("auto", "on", "off")
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _parse_tp_stage_split(spec: str | None) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    if spec is None:
+        return None
+    try:
+        left, right = spec.split(":", 1)
+        stage1 = tuple(int(part.strip()) for part in left.split(",") if part.strip())
+        stage2 = tuple(int(part.strip()) for part in right.split(",") if part.strip())
+    except ValueError as exc:
+        raise SystemExit("--tp-stage-split must have the form r0,r1,r2,r3:r4,r5,r6,r7") from exc
+    if len(stage1) != 4 or len(stage2) != 4:
+        raise SystemExit("--tp-stage-split currently requires exactly 4 ranks per stage")
+    if len(set(stage1)) != len(stage1) or len(set(stage2)) != len(stage2):
+        raise SystemExit("--tp-stage-split rank groups must not contain duplicates")
+    if set(stage1) & set(stage2):
+        raise SystemExit("--tp-stage-split stage rank groups must not overlap")
+    return stage1, stage2
+
+
+def _resolve_tp_output_rank(value: str, stage2_ranks: tuple[int, ...]) -> int:
+    normalized = value.strip().lower()
+    if normalized in {"stage2-leader", "stage2_leader", "stage2"}:
+        return stage2_ranks[0]
+    try:
+        output_rank = int(normalized)
+    except ValueError as exc:
+        raise SystemExit("--tp-output-rank must be stage2-leader or a global rank integer") from exc
+    if output_rank not in stage2_ranks:
+        raise SystemExit("--tp-output-rank must belong to the stage2 rank group")
+    return output_rank
+
+
+def _split_stage_barrier_marker(base_output_path: Path, run_idx: int, rank: int) -> Path:
+    barrier_dir = base_output_path.parent / f".{base_output_path.stem}.tp_split_barrier" / f"run_{run_idx:03d}"
+    return barrier_dir / f"rank_{rank}.done"
+
+
+def _prepare_split_stage_file_barrier(base_output_path: Path, run_idx: int, rank: int) -> None:
+    marker = _split_stage_barrier_marker(base_output_path, run_idx, rank)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.unlink(missing_ok=True)
+
+
+def _split_stage_file_barrier(
+    base_output_path: Path,
+    run_idx: int,
+    *,
+    rank: int,
+    world_size: int,
+    timeout_s: float = 7200.0,
+) -> None:
+    """Host-side repeat barrier for split-stage TP.
+
+    Split-stage ranks intentionally keep using stage-local HCCL subgroups while
+    other ranks may already be idle.  A default-process-group HCCL barrier can
+    therefore interleave with active subgroup collectives and time out on 910A.
+    Use a tiny filesystem marker barrier between repeats instead; it synchronizes
+    process control only and does not move model/latent tensors through CPU.
+    """
+
+    marker = _split_stage_barrier_marker(base_output_path, run_idx, rank)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    tmp.write_text("done\n")
+    tmp.replace(marker)
+
+    start = time.monotonic()
+    while True:
+        arrived = list(marker.parent.glob("rank_*.done"))
+        if len(arrived) >= world_size:
+            return
+        if time.monotonic() - start > timeout_s:
+            raise TimeoutError(
+                f"timed out waiting for split-stage file barrier run {run_idx}: "
+                f"{len(arrived)}/{world_size} ranks arrived at {marker.parent}"
+            )
+        time.sleep(0.5)
 
 
 def _env_enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in _TRUTHY_ENV_VALUES
+
+
+def _state_dict_cache_default() -> str:
+    value = os.getenv(_ASCEND_STATE_DICT_CACHE_ENV, "off").strip().lower()
+    if value in _ASCEND_STATE_DICT_CACHE_CHOICES:
+        return value
+    logging.warning(
+        "ignoring invalid %s=%r; expected one of %s",
+        _ASCEND_STATE_DICT_CACHE_ENV,
+        value,
+        ", ".join(_ASCEND_STATE_DICT_CACHE_CHOICES),
+    )
+    return "off"
+
+
+def _state_dict_cache_enabled(args: argparse.Namespace, device: torch.device) -> bool:
+    policy = args.state_dict_cache
+    if policy == "on":
+        return True
+    if policy == "off":
+        return False
+    return device.type == "npu" and args.tensor_parallel and args.pipeline == "two-stage-hq"
+
+
+def _log_state_dict_cache(args: argparse.Namespace, device: torch.device, enabled: bool) -> None:
+    if device.type != "npu" and args.state_dict_cache == "auto":
+        return
+    if enabled:
+        logging.info(
+            "using StateDictRegistry cache for model state_dict reuse (%s=%s)",
+            _ASCEND_STATE_DICT_CACHE_ENV,
+            args.state_dict_cache,
+        )
+    else:
+        logging.info(
+            "state-dict cache disabled (%s=%s)",
+            _ASCEND_STATE_DICT_CACHE_ENV,
+            args.state_dict_cache,
+        )
 
 
 def _log_experimental_precision_flags() -> None:
@@ -306,8 +425,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--devices",
-        default="0,1,2,3",
-        help="comma-separated NPU ids for layerwise/tensor-parallel sharding",
+        default=None,
+        help="comma-separated NPU ids for layerwise/tensor-parallel sharding; defaults to the first 4 NPUs, or all split-stage ranks",
     )
     parser.add_argument("--layerwise", action="store_true", help="spread transformer blocks across --devices")
     parser.add_argument(
@@ -319,6 +438,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--tensor-parallel",
         action="store_true",
         help="run full-model HCCL tensor parallelism (launch with torchrun)",
+    )
+    parser.add_argument(
+        "--tp-stage-split",
+        default=None,
+        help=(
+            "split two-stage-hq tensor-parallel ranks as stage1:stage2, e.g. "
+            "0,1,2,3:4,5,6,7; keeps each stage resident on its own 4-rank group"
+        ),
+    )
+    parser.add_argument(
+        "--tp-output-rank",
+        default="stage2-leader",
+        help="split-stage output rank: stage2-leader (default) or a global rank in the stage2 group",
     )
     parser.add_argument(
         "--resident-models",
@@ -342,6 +474,17 @@ def build_parser() -> argparse.ArgumentParser:
             "maximum transformer batch size; guided denoisers can batch up to 4 guidance passes "
             "when LTX2_NPU_BATCH_GUIDANCE=1"
         ),
+    )
+    parser.add_argument(
+        "--state-dict-cache",
+        choices=_ASCEND_STATE_DICT_CACHE_CHOICES,
+        default=_state_dict_cache_default(),
+        help=(
+            "state_dict cache policy for model weight loads; off by default because TP-HQ validation "
+            "showed high host-memory pressure; auto scopes the cache to Ascend tensor-parallel HQ and "
+            "%s can override the default"
+        )
+        % _ASCEND_STATE_DICT_CACHE_ENV,
     )
     parser.add_argument("--checkpoint", required=False, help="LTX-2 checkpoint safetensors path")
     parser.add_argument("--gemma-root", required=False, help="Gemma text encoder directory")
@@ -534,6 +677,17 @@ def _validate_preset_pipeline_compatibility(args: argparse.Namespace) -> None:
         raise SystemExit("--quality-preset hq requires --pipeline two-stage-hq")
     if args.pipeline == "two-stage-hq" and args.quality_preset != "hq":
         raise SystemExit("--pipeline two-stage-hq requires --quality-preset hq")
+    if args.tp_stage_split is not None:
+        if not args.tensor_parallel:
+            raise SystemExit("--tp-stage-split requires --tensor-parallel")
+        if args.pipeline != "two-stage-hq" or args.quality_preset != "hq":
+            raise SystemExit("--tp-stage-split currently supports only --quality-preset hq --pipeline two-stage-hq")
+        stage1_ranks, stage2_ranks = _parse_tp_stage_split(args.tp_stage_split)
+        args._tp_stage_split_ranks = (stage1_ranks, stage2_ranks)
+        args._tp_output_rank = _resolve_tp_output_rank(args.tp_output_rank, stage2_ranks)
+    else:
+        args._tp_stage_split_ranks = None
+        args._tp_output_rank = None
     if args.quality_preset == "smoke" and args.pipeline in ("two-stage", "two-stage-hq"):
         logging.warning("smoke preset with %s is for mechanics only, not visual quality", args.pipeline)
     ignored = [
@@ -640,7 +794,15 @@ def main() -> None:
         print("\n".join(npu_runtime_diagnostics(args.device)))
         return
 
-    from ltx_core.distributed.hccl import destroy_process_group, init_hccl_if_requested, is_rank0, local_rank
+    from ltx_core.distributed.hccl import (
+        destroy_process_group,
+        init_hccl_if_requested,
+        is_rank0,
+        local_rank,
+        rank as global_rank,
+        world_size as global_world_size,
+    )
+    from ltx_core.loader import StateDictRegistry
     from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
     from ltx_pipelines.distilled import DistilledPipeline
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
@@ -667,7 +829,10 @@ def main() -> None:
     if args.tensor_parallel and args.layerwise:
         raise SystemExit("--tensor-parallel and --layerwise are mutually exclusive")
 
-    tp_device_ids = parse_device_list(args.devices, default_count=4)
+    split_stage_ranks = _parse_tp_stage_split(args.tp_stage_split)
+    split_stage_tp = split_stage_ranks is not None
+    split_default_count = max(max(ranks) for ranks in split_stage_ranks) + 1 if split_stage_ranks is not None else 4
+    tp_device_ids = parse_device_list(args.devices, default_count=split_default_count)
     preflight_device_indices = {args.device}
     if args.layerwise or args.tensor_parallel:
         preflight_device_indices.update(device.index or 0 for device in tp_device_ids if device.type == "npu")
@@ -678,10 +843,18 @@ def main() -> None:
         raise SystemExit(str(exc)) from None
     if args.tensor_parallel:
         rank = local_rank()
+        if split_stage_ranks is not None:
+            required_ranks = set(split_stage_ranks[0]) | set(split_stage_ranks[1])
+            if rank not in required_ranks:
+                raise SystemExit(f"LOCAL_RANK {rank} is not included in --tp-stage-split ranks {sorted(required_ranks)}")
+            if len(tp_device_ids) <= max(required_ranks):
+                raise SystemExit("--devices must provide one NPU id for every split-stage rank")
         if rank >= len(tp_device_ids):
             raise SystemExit(f"LOCAL_RANK {rank} exceeds --devices list {tp_device_ids}")
         device_index = tp_device_ids[rank].index or 0
         device = init_hccl_if_requested(True, device_index=device_index)
+        if split_stage_ranks is not None and global_world_size() <= max(required_ranks):
+            raise SystemExit("torchrun world_size must cover every --tp-stage-split rank")
         group = hccs_group_for_device(device_index)
         logging.info(
             "rank %d using %s with HCCS group %s and dtype %s (tensor-parallel)",
@@ -704,6 +877,9 @@ def main() -> None:
     _set_default_attention_chunk(args, device)
     _log_attention_backend(device)
     _log_rope_backend(device)
+    state_dict_cache_enabled = _state_dict_cache_enabled(args, device)
+    _log_state_dict_cache(args, device, state_dict_cache_enabled)
+    registry = StateDictRegistry() if state_dict_cache_enabled else None
 
     loras = tuple(_parse_loras(args.lora))
     distilled_loras = list(_parse_loras(args.distilled_lora))
@@ -760,6 +936,7 @@ def main() -> None:
             loras=loras,
             device=device,
             quantization=None,
+            registry=registry,
             compilation_config=None,
             offload_mode=OffloadMode.NONE,
             layerwise_devices=layerwise_devices,
@@ -786,6 +963,7 @@ def main() -> None:
             loras=loras,
             device=device,
             quantization=None,
+            registry=registry,
             compilation_config=None,
             offload_mode=OffloadMode.NONE,
             layerwise_devices=layerwise_devices,
@@ -804,6 +982,21 @@ def main() -> None:
             random_draw_dtype=random_draw_dtype,
         )
     elif args.pipeline == "two-stage-hq":
+        from ltx_pipelines.ti2vid_two_stages_hq import TwoStageTPPlacement
+
+        tp_placement = None
+        if split_stage_ranks is not None:
+            tp_placement = TwoStageTPPlacement(
+                stage1_ranks=split_stage_ranks[0],
+                stage2_ranks=split_stage_ranks[1],
+                output_rank=_resolve_tp_output_rank(args.tp_output_rank, split_stage_ranks[1]),
+            )
+            logging.info(
+                "split-stage TP-HQ enabled: stage1 ranks=%s stage2 ranks=%s output_rank=%d",
+                ",".join(str(r) for r in tp_placement.stage1_ranks),
+                ",".join(str(r) for r in tp_placement.stage2_ranks),
+                tp_placement.output_rank,
+            )
         pipeline = TI2VidTwoStagesHQPipeline(
             checkpoint_path=args.checkpoint,
             distilled_lora=distilled_loras,
@@ -814,6 +1007,7 @@ def main() -> None:
             loras=loras,
             device=device,
             quantization=None,
+            registry=registry,
             compilation_config=None,
             offload_mode=OffloadMode.NONE,
             layerwise_devices=layerwise_devices,
@@ -828,6 +1022,7 @@ def main() -> None:
             text_encoder_layerwise_devices=text_encoder_layerwise_devices,
             tensor_parallel=args.tensor_parallel,
             resident_models=args.resident_models,
+            tensor_parallel_placement=tp_placement,
         )
     else:
         if args.tensor_parallel:
@@ -839,6 +1034,7 @@ def main() -> None:
             loras=loras,
             device=device,
             quantization=None,
+            registry=registry,
             compilation_config=None,
             offload_mode=OffloadMode.NONE,
             layerwise_devices=layerwise_devices,
@@ -857,6 +1053,9 @@ def main() -> None:
     base_output_path = Path(args.output)
 
     for run_idx in range(args.repeat):
+        if split_stage_tp:
+            _prepare_split_stage_file_barrier(base_output_path, run_idx, global_rank())
+
         start = time.perf_counter()
         seed = args.seed + run_idx
         if args.pipeline in ("one-stage", "two-stage", "two-stage-hq"):
@@ -903,7 +1102,12 @@ def main() -> None:
                 enhance_prompt=args.enhance_prompt,
             )
 
-        if not (args.tensor_parallel and not is_rank0()):
+        should_write_output = (
+            global_rank() == _resolve_tp_output_rank(args.tp_output_rank, split_stage_ranks[1])
+            if split_stage_ranks is not None
+            else not (args.tensor_parallel and not is_rank0())
+        )
+        if should_write_output:
             output_path = base_output_path
             if args.repeat > 1:
                 output_name = f"{base_output_path.stem}_{run_idx:03d}{base_output_path.suffix}"
@@ -926,7 +1130,15 @@ def main() -> None:
             )
 
         if args.tensor_parallel:
-            torch.distributed.barrier()
+            if split_stage_tp:
+                _split_stage_file_barrier(
+                    base_output_path,
+                    run_idx,
+                    rank=global_rank(),
+                    world_size=global_world_size(),
+                )
+            else:
+                torch.distributed.barrier()
 
     if args.tensor_parallel:
         destroy_process_group()

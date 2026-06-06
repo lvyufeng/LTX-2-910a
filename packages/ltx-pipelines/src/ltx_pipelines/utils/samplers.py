@@ -9,7 +9,7 @@ from tqdm import tqdm
 from ltx_core.components.diffusion_steps import EulerCfgPpDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.debug import dump_tensor
-from ltx_core.distributed.hccl import broadcast_tensor_like, is_distributed, is_rank0, world_size
+from ltx_core.distributed.hccl import HCCLGroup, broadcast_tensor_like, is_distributed, is_rank0, world_size
 from ltx_core.model.transformer import X0Model
 from ltx_core.utils import to_denoised, to_velocity
 from ltx_pipelines.utils.helpers import post_process_latent, profile_section, timesteps_from_mask
@@ -184,14 +184,17 @@ def _get_new_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
     return _channelwise_normalize(noise).to(dtype=x.dtype)
 
 
-def _broadcast_tp_noise(noise: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor | None:
-    if not is_distributed() or world_size() <= 1:
+def _broadcast_tp_noise(noise: torch.Tensor | None, x: torch.Tensor, tp_group: HCCLGroup | None = None) -> torch.Tensor | None:
+    if not is_distributed() or world_size(tp_group) <= 1:
         return noise
+    src = tp_group.leader_global_rank if tp_group is not None else 0
     return broadcast_tensor_like(
-        noise if is_rank0() else None,
+        noise if is_rank0(tp_group) else None,
         shape=x.shape,
         dtype=x.dtype,
         device=x.device,
+        src=src,
+        group=tp_group,
     )
 
 
@@ -199,18 +202,22 @@ def _draw_noise_for_all_ranks(
     x: torch.Tensor,
     generator: torch.Generator,
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor],
+    tp_group: HCCLGroup | None = None,
 ) -> torch.Tensor:
-    noise = new_noise_fn(x, generator) if not is_distributed() or world_size() <= 1 or is_rank0() else None
+    noise = new_noise_fn(x, generator) if not is_distributed() or world_size(tp_group) <= 1 or is_rank0(tp_group) else None
     noise_dtype = x.dtype
     if noise is not None:
         noise_dtype = noise.dtype
-    if not is_distributed() or world_size() <= 1:
+    if not is_distributed() or world_size(tp_group) <= 1:
         return noise
+    src = tp_group.leader_global_rank if tp_group is not None else 0
     return broadcast_tensor_like(
-        noise if is_rank0() else None,
+        noise if is_rank0(tp_group) else None,
         shape=x.shape,
         dtype=noise_dtype,
         device=x.device,
+        src=src,
+        group=tp_group,
     )
 
 
@@ -225,9 +232,10 @@ def _inject_sde_noise(
     step_idx: int,
     legacy_mode: bool = False,
     eta: float = 0.5,
+    tp_group: HCCLGroup | None = None,
 ) -> torch.Tensor:
     sigmas_copy = sigmas.clone()
-    new_noise = _draw_noise_for_all_ranks(state.latent, step_noise_generator, new_noise_fn)
+    new_noise = _draw_noise_for_all_ranks(state.latent, step_noise_generator, new_noise_fn, tp_group)
     if not legacy_mode:
         denoise_mask_f32 = state.denoise_mask.to(torch.float32)
         sigmas_copy_f32 = sigmas_copy.to(torch.float32)
@@ -265,6 +273,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_new_noise,
     model_dtype: torch.dtype = torch.float16,
     legacy_mode: bool = True,
+    tp_group: HCCLGroup | None = None,
 ) -> tuple[LatentState | None, LatentState | None]:
     """
     Joint audio-video denoising loop using the res_2s second-order sampler.
@@ -310,7 +319,11 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     step_noise_generator = torch.Generator(device=state_device).manual_seed(noise_seed)
     substep_noise_generator = torch.Generator(device=state_device).manual_seed(noise_seed_substep)
     sde_noise_injecting_fn = partial(
-        _inject_sde_noise, stepper=stepper, new_noise_fn=new_noise_fn, legacy_mode=legacy_mode
+        _inject_sde_noise,
+        stepper=stepper,
+        new_noise_fn=new_noise_fn,
+        legacy_mode=legacy_mode,
+        tp_group=tp_group,
     )
     step_noise_injecting_fn = partial(sde_noise_injecting_fn, step_noise_generator=step_noise_generator, eta=eta)
     # substep eta is always default 0.5 for compatibility with original implementation.
@@ -505,6 +518,7 @@ def euler_cfg_pp_denoising_loop(
     noise_seed: int = -1,
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_plain_noise,
     model_dtype: torch.dtype = torch.float16,
+    tp_group: HCCLGroup | None = None,
 ) -> tuple[LatentState | None, LatentState | None]:
     """
     Joint audio-video denoising loop using the CFG++ corrected Euler sampler.
@@ -587,12 +601,12 @@ def euler_cfg_pp_denoising_loop(
         # Draw noise consecutively from the same generator on rank 0, then broadcast it
         # so tensor-parallel ranks advance the same sample instead of independent samples.
         noise_video = (
-            _draw_noise_for_all_ranks(video_state.latent, generator, new_noise_fn)
+            _draw_noise_for_all_ranks(video_state.latent, generator, new_noise_fn, tp_group)
             if (video_state is not None and draw_noise)
             else None
         )
         noise_audio = (
-            _draw_noise_for_all_ranks(audio_state.latent, generator, new_noise_fn)
+            _draw_noise_for_all_ranks(audio_state.latent, generator, new_noise_fn, tp_group)
             if (audio_state is not None and draw_noise)
             else None
         )

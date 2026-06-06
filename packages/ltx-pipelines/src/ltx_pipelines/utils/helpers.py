@@ -9,7 +9,7 @@ import torch
 
 from ltx_core.accelerator import cleanup_memory as ascend_cleanup_memory
 from ltx_core.accelerator import get_default_device, synchronize
-from ltx_core.distributed.hccl import is_rank0
+from ltx_core.distributed.hccl import is_rank0, rank
 
 from ltx_core.components.noisers import Noiser
 from ltx_core.conditioning import (
@@ -49,9 +49,23 @@ def profile_enabled() -> bool:
     return os.environ.get("LTX2_ASCEND_PROFILE", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _profile_rank_enabled() -> bool:
+    ranks = os.environ.get("LTX2_ASCEND_PROFILE_RANKS", "").strip()
+    if not ranks:
+        return is_rank0()
+    if ranks.lower() in {"all", "*"}:
+        return True
+    try:
+        enabled = {int(part.strip()) for part in ranks.split(",") if part.strip()}
+    except ValueError:
+        logger.warning("ignoring invalid LTX2_ASCEND_PROFILE_RANKS=%r", ranks)
+        return is_rank0()
+    return rank() in enabled
+
+
 @contextmanager
 def profile_section(name: str, device: torch.device | None = None) -> Iterator[None]:
-    if not profile_enabled() or not is_rank0():
+    if not profile_enabled() or not _profile_rank_enabled():
         yield
         return
     synchronize(device)
@@ -60,7 +74,7 @@ def profile_section(name: str, device: torch.device | None = None) -> Iterator[N
         yield
     finally:
         synchronize(device)
-        logger.info("[profile] %s %.3fs", name, time.perf_counter() - start)
+        logger.info("[profile][rank%d] %s %.3fs", rank(), name, time.perf_counter() - start)
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:

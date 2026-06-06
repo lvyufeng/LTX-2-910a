@@ -1,6 +1,9 @@
 import logging
+import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Generic
+from typing import Generic, Iterator
 
 import torch
 from torch import nn
@@ -23,6 +26,22 @@ from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator, ModelType
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _profile_detail_enabled() -> bool:
+    return os.environ.get("LTX2_ASCEND_PROFILE_DETAIL", "").lower() in {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _profile_detail_section(name: str) -> Iterator[None]:
+    if not _profile_detail_enabled():
+        yield
+        return
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("[profile-detail] model_builder.%s %.3fs", name, time.perf_counter() - start)
 
 
 def _check_uninitialized(model: nn.Module) -> list[str]:
@@ -53,30 +72,39 @@ def _load_model_weights(
     if lora_load_device is None:
         lora_load_device = device
 
-    model_sd = load_state_dict(model_path, loader, registry, device, model_sd_ops)
+    with _profile_detail_section("load_base"):
+        model_sd = load_state_dict(model_path, loader, registry, device, model_sd_ops)
 
     lora_strengths = [lora.strength for lora in loras]
     if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
         sd = model_sd.sd
         if dtype is not None:
-            sd = {key: value.to(dtype=dtype) for key, value in sd.items()}
-        meta_model.load_state_dict(sd, strict=False, assign=True)
+            with _profile_detail_section("cast_base"):
+                sd = {key: value.to(dtype=dtype) for key, value in sd.items()}
+        with _profile_detail_section("assign_base"):
+            meta_model.load_state_dict(sd, strict=False, assign=True)
         return
 
-    lora_state_dicts = [load_state_dict([lora.path], loader, registry, lora_load_device, lora.sd_ops) for lora in loras]
+    with _profile_detail_section("load_loras"):
+        lora_state_dicts = [
+            load_state_dict([lora.path], loader, registry, lora_load_device, lora.sd_ops) for lora in loras
+        ]
     lora_sd_and_strengths = [
         LoraStateDictWithStrength(sd, strength) for sd, strength in zip(lora_state_dicts, lora_strengths, strict=True)
     ]
-    final_sd = apply_loras(
-        model_sd=model_sd,
-        lora_sd_and_strengths=lora_sd_and_strengths,
-        fuse_rule=fuse_rule,
-        destination_sd=model_sd if isinstance(registry, DummyRegistry) else None,
-    )
+    with _profile_detail_section("apply_loras"):
+        final_sd = apply_loras(
+            model_sd=model_sd,
+            lora_sd_and_strengths=lora_sd_and_strengths,
+            fuse_rule=fuse_rule,
+            destination_sd=model_sd if isinstance(registry, DummyRegistry) else None,
+        )
     fused_sd = final_sd.sd
     if dtype is not None:
-        fused_sd = {key: value.to(dtype=dtype) for key, value in fused_sd.items()}
-    meta_model.load_state_dict(fused_sd, strict=False, assign=True)
+        with _profile_detail_section("cast_fused"):
+            fused_sd = {key: value.to(dtype=dtype) for key, value in fused_sd.items()}
+    with _profile_detail_section("assign_fused"):
+        meta_model.load_state_dict(fused_sd, strict=False, assign=True)
 
 
 @dataclass(frozen=True)
@@ -157,26 +185,31 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         device = get_default_device() if device is None else device
         post_load_ops = tuple(op for op in self.module_ops if getattr(op.mutator, "_ltx2_post_load", False))
         load_device = torch.device("cpu") if post_load_ops or device.type == "npu" else device
-        config = self.model_config()
-        meta_model = self.meta_model(config, self.module_ops)
+        with _profile_detail_section("model_config"):
+            config = self.model_config()
+        with _profile_detail_section("meta_model"):
+            meta_model = self.meta_model(config, self.module_ops)
 
         load_dtype = dtype
         if device.type == "npu" and load_dtype is None:
             load_dtype = torch.float16
-        _load_model_weights(
-            meta_model=meta_model,
-            model_path=self.model_path,
-            loras=self.loras,
-            loader=self.model_loader,
-            registry=self.registry,
-            device=load_device,
-            dtype=load_dtype,
-            model_sd_ops=self.model_sd_ops,
-            lora_load_device=self.lora_load_device,
-            fuse_rule=self.fuse_rule,
-        )
-        model = self._return_model(meta_model, load_device if post_load_ops else device)
+        with _profile_detail_section("load_weights"):
+            _load_model_weights(
+                meta_model=meta_model,
+                model_path=self.model_path,
+                loras=self.loras,
+                loader=self.model_loader,
+                registry=self.registry,
+                device=load_device,
+                dtype=load_dtype,
+                model_sd_ops=self.model_sd_ops,
+                lora_load_device=self.lora_load_device,
+                fuse_rule=self.fuse_rule,
+            )
+        with _profile_detail_section(f"return_model.{device.type}"):
+            model = self._return_model(meta_model, load_device if post_load_ops else device)
         for op in post_load_ops:
             if op.matcher(model):
-                model = op.mutator(model)
+                with _profile_detail_section(f"post_load_op.{op.name}"):
+                    model = op.mutator(model)
         return model

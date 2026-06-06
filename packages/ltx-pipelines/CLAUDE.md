@@ -53,7 +53,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 ## Shared building blocks (`utils/blocks.py`)
 
 - `DiffusionStage` -- owns transformer lifecycle; builds model on call, frees on exit via `gpu_model()` context manager (moves params to meta device to release GPU/CPU memory). Accepts optional `stepper` and `loop` overrides.
-- `PromptEncoder` -- Gemma text encoder + embeddings processor (video 4096-dim, audio 2048-dim).
+- `PromptEncoder` -- Gemma text encoder + embeddings processor (video 4096-dim, audio 2048-dim). Reuses the most recent in-memory prompt embeddings by default when prompt/cache inputs match across repeated calls; set `LTX2_PROMPT_EMBEDDINGS_CACHE=0` to disable.
 - `ImageConditioner` / `AudioConditioner` -- temporary encoder scope; builds encoder, passes to callable, frees.
 - `VideoUpsampler` -- 2x spatial upsampling via encoder + upsampler.
 - `VideoDecoder` / `AudioDecoder` -- latent-to-pixel decoding (iterator for video, `Audio` for audio).

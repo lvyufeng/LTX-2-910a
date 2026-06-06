@@ -27,9 +27,10 @@ def _to_device_safe(value: torch.Tensor, device: torch.device) -> torch.Tensor:
     return value.to(device=device, non_blocking=True)
 
 
-def _all_gather_channels(value: torch.Tensor) -> torch.Tensor:
-    gathered = [torch.empty_like(value) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, value.contiguous())
+def _all_gather_channels(value: torch.Tensor, process_group: dist.ProcessGroup | None = None) -> torch.Tensor:
+    world_size = dist.get_world_size(group=process_group)
+    gathered = [torch.empty_like(value) for _ in range(world_size)]
+    dist.all_gather(gathered, value.contiguous(), group=process_group)
     return torch.cat(gathered, dim=1).contiguous()
 
 
@@ -71,25 +72,41 @@ def _copy_group_norm_channels(source: nn.GroupNorm, channels: slice, device: tor
 
 
 class HCCLRowParallelConv(nn.Module):
-    def __init__(self, source: nn.Conv2d | nn.Conv3d, rows: slice, *, device: torch.device, gather_input: bool) -> None:
+    def __init__(
+        self,
+        source: nn.Conv2d | nn.Conv3d,
+        rows: slice,
+        *,
+        device: torch.device,
+        gather_input: bool,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         self.conv = _copy_conv_rows(source, rows, device)
         self.device = device
         self.gather_input = gather_input
+        self.process_group = process_group
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.to(self.device)
         if self.gather_input:
-            x = _all_gather_channels(x)
+            x = _all_gather_channels(x, self.process_group)
         return self.conv(x)
 
 
 class HCCLChannelParallelResBlock(nn.Module):
-    def __init__(self, source: ResBlock, channels: slice, *, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: ResBlock,
+        channels: slice,
+        *,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
-        self.conv1 = HCCLRowParallelConv(source.conv1, channels, device=device, gather_input=True)
+        self.conv1 = HCCLRowParallelConv(source.conv1, channels, device=device, gather_input=True, process_group=process_group)
         self.norm1 = _copy_group_norm_channels(source.norm1, channels, device)
-        self.conv2 = HCCLRowParallelConv(source.conv2, channels, device=device, gather_input=True)
+        self.conv2 = HCCLRowParallelConv(source.conv2, channels, device=device, gather_input=True, process_group=process_group)
         self.norm2 = _copy_group_norm_channels(source.norm2, channels, device)
         self.activation = nn.SiLU()
         self.device = device
@@ -105,10 +122,17 @@ class HCCLChannelParallelResBlock(nn.Module):
 
 
 class HCCLChannelParallelSpatialRationalResampler(nn.Module):
-    def __init__(self, source: SpatialRationalResampler, channels: slice, *, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: SpatialRationalResampler,
+        channels: slice,
+        *,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         conv_rows = slice(channels.start * source.num**2, channels.stop * source.num**2)
-        self.conv = HCCLRowParallelConv(source.conv, conv_rows, device=device, gather_input=True)
+        self.conv = HCCLRowParallelConv(source.conv, conv_rows, device=device, gather_input=True, process_group=process_group)
         self.pixel_shuffle = source.pixel_shuffle
         self.blur_down = source.blur_down.to(device)
         self.device = device
@@ -125,11 +149,20 @@ class HCCLChannelParallelSpatialRationalResampler(nn.Module):
 
 
 class HCCLChannelParallelLatentUpsampler(nn.Module):
-    def __init__(self, source: LatentUpsampler, *, rank: int, world_size: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: LatentUpsampler,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.process_group = process_group
         self.in_channels = source.in_channels
         self.mid_channels = source.mid_channels
         self.num_blocks_per_stage = source.num_blocks_per_stage
@@ -141,21 +174,21 @@ class HCCLChannelParallelLatentUpsampler(nn.Module):
 
         self.mid_slice = _shard_range(source.mid_channels, rank, world_size)
         self.final_slice = _shard_range(source.in_channels, rank, world_size)
-        self.initial_conv = HCCLRowParallelConv(source.initial_conv, self.mid_slice, device=device, gather_input=False)
+        self.initial_conv = HCCLRowParallelConv(source.initial_conv, self.mid_slice, device=device, gather_input=False, process_group=process_group)
         self.initial_norm = _copy_group_norm_channels(source.initial_norm, self.mid_slice, device)
         self.initial_activation = nn.SiLU()
         self.res_blocks = nn.ModuleList(
-            [HCCLChannelParallelResBlock(block, self.mid_slice, device=device) for block in source.res_blocks]
+            [HCCLChannelParallelResBlock(block, self.mid_slice, device=device, process_group=process_group) for block in source.res_blocks]
         )
         self.upsampler = self._build_upsampler(source.upsampler)
         self.post_upsample_res_blocks = nn.ModuleList(
-            [HCCLChannelParallelResBlock(block, self.mid_slice, device=device) for block in source.post_upsample_res_blocks]
+            [HCCLChannelParallelResBlock(block, self.mid_slice, device=device, process_group=process_group) for block in source.post_upsample_res_blocks]
         )
-        self.final_conv = HCCLRowParallelConv(source.final_conv, self.final_slice, device=device, gather_input=True)
+        self.final_conv = HCCLRowParallelConv(source.final_conv, self.final_slice, device=device, gather_input=True, process_group=process_group)
 
     def _build_upsampler(self, source: nn.Module) -> nn.Module:
         if isinstance(source, SpatialRationalResampler):
-            return HCCLChannelParallelSpatialRationalResampler(source, self.mid_slice, device=self.device)
+            return HCCLChannelParallelSpatialRationalResampler(source, self.mid_slice, device=self.device, process_group=self.process_group)
         if isinstance(source, nn.Sequential) and len(source) == 2 and isinstance(source[1], PixelShuffleND):
             conv = source[0]
             if not isinstance(conv, (nn.Conv2d, nn.Conv3d)):
@@ -163,7 +196,7 @@ class HCCLChannelParallelLatentUpsampler(nn.Module):
             factor = conv.out_channels // self.mid_channels
             rows = slice(self.mid_slice.start * factor, self.mid_slice.stop * factor)
             return nn.Sequential(
-                HCCLRowParallelConv(conv, rows, device=self.device, gather_input=True),
+                HCCLRowParallelConv(conv, rows, device=self.device, gather_input=True, process_group=self.process_group),
                 source[1],
             )
         raise TypeError(f"unsupported latent upsampler module {type(source)!r}")
@@ -193,7 +226,7 @@ class HCCLChannelParallelLatentUpsampler(nn.Module):
             x = block(x)
 
         x = self.final_conv(x)
-        return _all_gather_channels(x)
+        return _all_gather_channels(x, self.process_group)
 
 
 def apply_hccl_upsampler_tensor_parallel(
@@ -202,22 +235,30 @@ def apply_hccl_upsampler_tensor_parallel(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
 ) -> nn.Module:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("HCCL upsampler tensor parallelism requires torch.distributed.init_process_group('hccl')")
-    rank = dist.get_rank() if rank is None else rank
-    world_size = dist.get_world_size() if world_size is None else world_size
+    rank = dist.get_rank(group=process_group) if rank is None else rank
+    world_size = dist.get_world_size(group=process_group) if world_size is None else world_size
     if device is None:
-        device = torch.device("npu", int(__import__("os").environ.get("LOCAL_RANK", rank)))
+        device = torch.device("npu", int(__import__("os").environ.get("LOCAL_RANK", dist.get_rank())))
     if world_size <= 1:
         return model.to(device)
     if not isinstance(model, LatentUpsampler):
         return model.to(device)
-    wrapped = HCCLChannelParallelLatentUpsampler(model, rank=rank, world_size=world_size, device=device)
+    wrapped = HCCLChannelParallelLatentUpsampler(
+        model,
+        rank=rank,
+        world_size=world_size,
+        device=device,
+        process_group=process_group,
+    )
     wrapped.tensor_parallel = True
     wrapped.tensor_parallel_rank = rank
     wrapped.tensor_parallel_world_size = world_size
     wrapped.tensor_parallel_device = device
+    wrapped.tensor_parallel_process_group = process_group
     return wrapped.eval()
 
 
@@ -226,14 +267,22 @@ def build_hccl_upsampler_tensor_parallel_op(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
+    label: str | None = None,
 ) -> ModuleOps:
-    label = f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
+    label = label or f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
 
     def matcher(model: nn.Module) -> bool:
         return isinstance(model, LatentUpsampler)
 
     def mutator(model: nn.Module) -> nn.Module:
-        return apply_hccl_upsampler_tensor_parallel(model, rank=rank, world_size=world_size, device=device)
+        return apply_hccl_upsampler_tensor_parallel(
+            model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
 
     mutator._ltx2_post_load = True
     return ModuleOps(name=f"ascend_hccl_upsampler_tensor_parallel_{label}", matcher=matcher, mutator=mutator)

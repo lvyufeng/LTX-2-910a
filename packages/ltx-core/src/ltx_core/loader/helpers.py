@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import time
 from typing import TypeVar
 
 import torch
@@ -14,6 +17,15 @@ from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelConfigurator
 
 _M = TypeVar("_M", bound=nn.Module)
+logger = logging.getLogger(__name__)
+
+
+def _profile_detail_enabled() -> bool:
+    return os.environ.get("LTX2_ASCEND_PROFILE_DETAIL", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _sd_ops_name(sd_ops: SDOps | None) -> str:
+    return sd_ops.name if sd_ops is not None else "<none>"
 
 
 def load_state_dict(
@@ -30,10 +42,24 @@ def load_state_dict(
         path_list = list(paths)
     else:
         path_list = paths
+    detail = _profile_detail_enabled()
+    sd_ops_label = _sd_ops_name(sd_ops)
     cached = registry.get(path_list, sd_ops)
     if cached is not None:
+        if detail:
+            logger.info("[profile-detail] state_dict.cache_hit paths=%d sd_ops=%s", len(path_list), sd_ops_label)
         return cached
+    if detail:
+        logger.info("[profile-detail] state_dict.cache_miss paths=%d sd_ops=%s", len(path_list), sd_ops_label)
+    start = time.perf_counter() if detail else 0.0
     result = loader.load(path_list, sd_ops=sd_ops, device=device)
+    if detail:
+        logger.info(
+            "[profile-detail] state_dict.load paths=%d sd_ops=%s %.3fs",
+            len(path_list),
+            sd_ops_label,
+            time.perf_counter() - start,
+        )
     registry.add(path_list, sd_ops=sd_ops, state_dict=result)
     return result
 

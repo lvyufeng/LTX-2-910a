@@ -1,6 +1,7 @@
 import enum
 import logging
 import math
+import os
 import threading
 from collections.abc import Generator, Iterator
 from fractions import Fraction
@@ -324,6 +325,51 @@ def _resample_audio(
         container.mux(packet)
 
 
+_OUTPUT_CONVERT_FRAME_BATCH_ENV = "LTX2_ASCEND_OUTPUT_CONVERT_FRAME_BATCH"
+
+
+def _output_convert_frame_batch(chunk: torch.Tensor) -> int:
+    if chunk.device.type != "npu":
+        return 0
+    value = os.getenv(_OUTPUT_CONVERT_FRAME_BATCH_ENV, "8").strip()
+    try:
+        batch = int(value)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r; expected integer", _OUTPUT_CONVERT_FRAME_BATCH_ENV, value)
+        return 8
+    return max(batch, 0)
+
+
+def _converted_cpu_chunks(
+    chunk: torch.Tensor,
+    frame_converter: FrameConverter,
+) -> Generator[np.ndarray, None, None]:
+    frames = chunk.movedim(-1, -3)
+    frame_batch = _output_convert_frame_batch(frames)
+    if frame_batch <= 0 or frames.ndim < 4 or frames.shape[0] <= frame_batch:
+        yield frame_converter(frames).to("cpu").numpy()
+        return
+    for start in range(0, frames.shape[0], frame_batch):
+        converted = frame_converter(frames[start : start + frame_batch].contiguous())
+        yield converted.to("cpu").numpy()
+
+
+def _first_converted_cpu_chunk(
+    video: Iterator[torch.Tensor],
+    frame_converter: FrameConverter,
+) -> tuple[np.ndarray, Iterator[np.ndarray]]:
+    first_video_chunk = next(video)
+    converted = _converted_cpu_chunks(first_video_chunk, frame_converter)
+    first_cpu_chunk = next(converted)
+
+    def remaining() -> Iterator[np.ndarray]:
+        yield from converted
+        for chunk in video:
+            yield from _converted_cpu_chunks(chunk, frame_converter)
+
+    return first_cpu_chunk, remaining()
+
+
 def encode_video(
     video: torch.Tensor | Iterator[torch.Tensor],
     fps: int,
@@ -338,10 +384,7 @@ def encode_video(
     if isinstance(video, torch.Tensor):
         video = iter([video])
 
-    def convert(chunk: torch.Tensor) -> torch.Tensor:
-        return frame_converter(chunk.movedim(-1, -3))
-
-    first_chunk = convert(next(video))
+    first_chunk, remaining_chunks = _first_converted_cpu_chunk(video, frame_converter)
 
     if frame_converter.pixel_format == PixelFormat.RGB24:
         height, width = first_chunk.shape[-3], first_chunk.shape[-2]
@@ -369,16 +412,15 @@ def encode_video(
         av_format = frame_converter.pixel_format.av_format
 
         def cpu_chunks() -> Generator[np.ndarray, None, None]:
-            yield first_chunk.to("cpu").numpy()
-            for chunk in video:
-                yield convert(chunk).to("cpu").numpy()
+            yield first_chunk
+            yield from remaining_chunks
 
         _encode_chunks_threaded(
             container=container,
             stream=stream,
             av_format=av_format,
             chunks=cpu_chunks(),
-            progress_total=video_chunks_number,
+            progress_total=None,
         )
 
         if audio is not None:
@@ -396,7 +438,7 @@ def _encode_chunks_threaded(
     stream: av.video.stream.VideoStream,
     av_format: str,
     chunks: Iterator[np.ndarray],
-    progress_total: int,
+    progress_total: int | None,
 ) -> None:
     """Run libx264 frame.encode + container.mux on a background thread while
     the caller produces numpy chunks on the current thread. The 1-slot queue

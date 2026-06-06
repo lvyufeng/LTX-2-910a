@@ -51,12 +51,21 @@ def _copy_linear_columns_without_bias(source: nn.Linear, columns: slice, device:
 
 
 class HCCLVocabParallelEmbedding(nn.Module):
-    def __init__(self, source: nn.Embedding, *, rank: int, world_size: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: nn.Embedding,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         rows = _shard_range(source.num_embeddings, rank, world_size)
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.process_group = process_group
         self.vocab_start = rows.start
         self.vocab_end = rows.stop
         self.num_embeddings = source.num_embeddings
@@ -73,17 +82,26 @@ class HCCLVocabParallelEmbedding(nn.Module):
         local_ids = (input_ids - self.vocab_start).masked_fill(~local_mask, 0)
         output = F.embedding(local_ids, self.weight)
         output = output * local_mask.unsqueeze(-1).to(output.dtype)
-        dist.all_reduce(output, op=dist.ReduceOp.SUM)
+        dist.all_reduce(output, op=dist.ReduceOp.SUM, group=self.process_group)
         return output * self.embed_scale.to(dtype=output.dtype)
 
 
 class HCCLVocabParallelLinear(nn.Module):
-    def __init__(self, source: nn.Linear, *, rank: int, world_size: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: nn.Linear,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         rows = _shard_range(source.out_features, rank, world_size)
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.process_group = process_group
         self.in_features = source.in_features
         self.out_features = source.out_features
         self.local_out_features = rows.stop - rows.start
@@ -97,17 +115,26 @@ class HCCLVocabParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         local = F.linear(x.to(self.device), self.weight, self.bias)
         gathered = [torch.empty_like(local) for _ in range(self.world_size)]
-        dist.all_gather(gathered, local)
+        dist.all_gather(gathered, local, group=self.process_group)
         return torch.cat(gathered, dim=-1)
 
 
 class HCCLColumnParallelLinear(nn.Module):
-    def __init__(self, source: nn.Linear, *, rank: int, world_size: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: nn.Linear,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
         columns = _shard_range(source.in_features, rank, world_size)
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.process_group = process_group
         self.in_features = source.in_features
         self.out_features = source.out_features
         self.input_slice = columns
@@ -122,7 +149,7 @@ class HCCLColumnParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_local = x[..., self.input_slice].to(self.device)
         result = F.linear(x_local, self.weight, None)
-        dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=self.process_group)
         if self.bias is not None:
             result = result + self.bias
         return result
@@ -136,11 +163,13 @@ class HCCLTensorParallelGemmaAttention(nn.Module):
         rank: int,
         world_size: int,
         device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
         self.rank = rank
         self.world_size = world_size
         self.device = device
+        self.process_group = process_group
         self.config = source.config
         self.layer_idx = source.layer_idx
         self.is_sliding = source.is_sliding
@@ -215,15 +244,24 @@ class HCCLTensorParallelGemmaAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(*input_shape, -1)
 
         result = self.o_proj(attn_output)
-        dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=self.process_group)
         if self.out_bias is not None:
             result = result + self.out_bias
         return result, attn_weights if kwargs.get("output_attentions", False) else None
 
 
 class HCCLTensorParallelGemmaMLP(nn.Module):
-    def __init__(self, source: Gemma3MLP, *, rank: int, world_size: int, device: torch.device) -> None:
+    def __init__(
+        self,
+        source: Gemma3MLP,
+        *,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        process_group: dist.ProcessGroup | None = None,
+    ) -> None:
         super().__init__()
+        self.process_group = process_group
         rows = _shard_range(source.intermediate_size, rank, world_size)
         self.gate_proj = _copy_linear_rows(source.gate_proj, rows, device)
         self.up_proj = _copy_linear_rows(source.up_proj, rows, device)
@@ -237,7 +275,7 @@ class HCCLTensorParallelGemmaMLP(nn.Module):
         x = x.to(self.gate_proj.weight.device)
         hidden = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         result = self.down_proj(hidden)
-        dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        dist.all_reduce(result, op=dist.ReduceOp.SUM, group=self.process_group)
         return result
 
 
@@ -253,13 +291,14 @@ def apply_hccl_gemma_tensor_parallel(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
 ) -> GemmaTextEncoder:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("Gemma HCCL tensor parallelism requires torch.distributed.init_process_group('hccl')")
-    rank = dist.get_rank() if rank is None else rank
-    world_size = dist.get_world_size() if world_size is None else world_size
+    rank = dist.get_rank(group=process_group) if rank is None else rank
+    world_size = dist.get_world_size(group=process_group) if world_size is None else world_size
     if device is None:
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
         device = torch.device("npu", local_rank)
     if world_size <= 1:
         return model.to(device)
@@ -273,14 +312,33 @@ def apply_hccl_gemma_tensor_parallel(
         rank=rank,
         world_size=world_size,
         device=device,
+        process_group=process_group,
     )
     conditional = model.model
     if hasattr(conditional, "lm_head"):
-        conditional.lm_head = HCCLVocabParallelLinear(conditional.lm_head, rank=rank, world_size=world_size, device=device)
+        conditional.lm_head = HCCLVocabParallelLinear(
+            conditional.lm_head,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
 
     for layer in language_model.layers:
-        layer.self_attn = HCCLTensorParallelGemmaAttention(layer.self_attn, rank=rank, world_size=world_size, device=device)
-        layer.mlp = HCCLTensorParallelGemmaMLP(layer.mlp, rank=rank, world_size=world_size, device=device)
+        layer.self_attn = HCCLTensorParallelGemmaAttention(
+            layer.self_attn,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
+        layer.mlp = HCCLTensorParallelGemmaMLP(
+            layer.mlp,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
         layer.to(device)
         gc.collect()
 
@@ -289,6 +347,7 @@ def apply_hccl_gemma_tensor_parallel(
     model.gemma_tensor_parallel_rank = rank
     model.gemma_tensor_parallel_world_size = world_size
     model.gemma_tensor_parallel_device = device
+    model.gemma_tensor_parallel_process_group = process_group
     return model
 
 
@@ -297,20 +356,34 @@ def build_hccl_gemma_tensor_parallel_op(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
+    label: str | None = None,
 ) -> ModuleOps:
-    label = f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
+    label = label or f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
 
     def matcher(model: torch.nn.Module) -> bool:
         return isinstance(model, GemmaTextEncoder) and _language_model(model) is not None
 
     def mutator(model: GemmaTextEncoder) -> GemmaTextEncoder:
-        return apply_hccl_gemma_tensor_parallel(model, rank=rank, world_size=world_size, device=device)
+        return apply_hccl_gemma_tensor_parallel(
+            model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
 
     mutator._ltx2_post_load = True
     return ModuleOps(name=f"ascend_hccl_gemma_tensor_parallel_{label}", matcher=matcher, mutator=mutator)
 
 
-def _replace_connector_blocks(connector: nn.Module | None, rank: int, world_size: int, device: torch.device) -> None:
+def _replace_connector_blocks(
+    connector: nn.Module | None,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    process_group: dist.ProcessGroup | None = None,
+) -> None:
     if connector is None:
         return
     blocks = getattr(connector, "transformer_1d_blocks", None)
@@ -319,9 +392,21 @@ def _replace_connector_blocks(connector: nn.Module | None, rank: int, world_size
         return
     for block in blocks:
         if hasattr(block, "attn1"):
-            block.attn1 = HCCLTensorParallelAttention(block.attn1, rank=rank, world_size=world_size, device=device)
+            block.attn1 = HCCLTensorParallelAttention(
+                block.attn1,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                process_group=process_group,
+            )
         if hasattr(block, "ff"):
-            block.ff = HCCLTensorParallelFeedForward(block.ff, rank=rank, world_size=world_size, device=device)
+            block.ff = HCCLTensorParallelFeedForward(
+                block.ff,
+                rank=rank,
+                world_size=world_size,
+                device=device,
+                process_group=process_group,
+            )
         block.to(device)
         gc.collect()
     connector.to(device)
@@ -333,13 +418,14 @@ def apply_hccl_embeddings_processor_tensor_parallel(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
 ) -> EmbeddingsProcessor:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("Embeddings processor HCCL tensor parallelism requires torch.distributed.init_process_group('hccl')")
-    rank = dist.get_rank() if rank is None else rank
-    world_size = dist.get_world_size() if world_size is None else world_size
+    rank = dist.get_rank(group=process_group) if rank is None else rank
+    world_size = dist.get_world_size(group=process_group) if world_size is None else world_size
     if device is None:
-        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        local_rank = int(os.environ.get("LOCAL_RANK", dist.get_rank()))
         device = torch.device("npu", local_rank)
     if world_size <= 1:
         return model.to(device)
@@ -351,6 +437,7 @@ def apply_hccl_embeddings_processor_tensor_parallel(
             rank=rank,
             world_size=world_size,
             device=device,
+            process_group=process_group,
         )
     if hasattr(feature_extractor, "video_aggregate_embed"):
         feature_extractor.video_aggregate_embed = HCCLColumnParallelLinear(
@@ -358,6 +445,7 @@ def apply_hccl_embeddings_processor_tensor_parallel(
             rank=rank,
             world_size=world_size,
             device=device,
+            process_group=process_group,
         )
     if hasattr(feature_extractor, "audio_aggregate_embed") and feature_extractor.audio_aggregate_embed is not None:
         feature_extractor.audio_aggregate_embed = HCCLColumnParallelLinear(
@@ -365,16 +453,18 @@ def apply_hccl_embeddings_processor_tensor_parallel(
             rank=rank,
             world_size=world_size,
             device=device,
+            process_group=process_group,
         )
     feature_extractor.to(device)
 
-    _replace_connector_blocks(model.video_connector, rank, world_size, device)
-    _replace_connector_blocks(model.audio_connector, rank, world_size, device)
+    _replace_connector_blocks(model.video_connector, rank, world_size, device, process_group)
+    _replace_connector_blocks(model.audio_connector, rank, world_size, device, process_group)
     model.to(device)
     model.tensor_parallel = True
     model.tensor_parallel_rank = rank
     model.tensor_parallel_world_size = world_size
     model.tensor_parallel_device = device
+    model.tensor_parallel_process_group = process_group
     return model
 
 
@@ -383,14 +473,22 @@ def build_hccl_embeddings_processor_tensor_parallel_op(
     rank: int | None = None,
     world_size: int | None = None,
     device: torch.device | None = None,
+    process_group: dist.ProcessGroup | None = None,
+    label: str | None = None,
 ) -> ModuleOps:
-    label = f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
+    label = label or f"rank{rank if rank is not None else 'env'}_world{world_size if world_size is not None else 'env'}"
 
     def matcher(model: torch.nn.Module) -> bool:
         return isinstance(model, EmbeddingsProcessor)
 
     def mutator(model: EmbeddingsProcessor) -> EmbeddingsProcessor:
-        return apply_hccl_embeddings_processor_tensor_parallel(model, rank=rank, world_size=world_size, device=device)
+        return apply_hccl_embeddings_processor_tensor_parallel(
+            model,
+            rank=rank,
+            world_size=world_size,
+            device=device,
+            process_group=process_group,
+        )
 
     mutator._ltx2_post_load = True
     return ModuleOps(name=f"ascend_hccl_embeddings_processor_tensor_parallel_{label}", matcher=matcher, mutator=mutator)

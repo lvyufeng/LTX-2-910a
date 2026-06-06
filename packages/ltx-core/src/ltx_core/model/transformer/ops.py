@@ -54,7 +54,12 @@ class PytorchAdaZeroFunction(AdaZeroCallable):
         scale: torch.Tensor,
         shift: torch.Tensor,
     ) -> torch.Tensor:
-        return rms_norm(x, eps=eps) * (1 + scale) + shift
+        out = rms_norm(x, eps=eps)
+        if not torch.is_grad_enabled():
+            out.mul_(1 + scale)
+            out.add_(shift)
+            return out
+        return out * (1 + scale) + shift
 
 
 class PostSACallable(Protocol):
@@ -101,5 +106,8 @@ class PytorchGatedAttention(GatedAttentionCallable):
         b, t, _ = attn_out.shape
         out = attn_out.view(b, t, attn_module.heads, attn_module.dim_head)
         gates = 2.0 * torch.sigmoid(gate_logits)  # (B, T, H)
-        out = out * gates.unsqueeze(-1)  # (B, T, H, D) * (B, T, H, 1)
+        if not torch.is_grad_enabled():
+            out.mul_(gates.unsqueeze(-1))  # (B, T, H, D) * (B, T, H, 1)
+        else:
+            out = out * gates.unsqueeze(-1)
         return out.view(b, t, attn_module.heads * attn_module.dim_head)
